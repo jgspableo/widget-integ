@@ -1,302 +1,208 @@
-/* global window */
+(() => {
+  const LOG = (...a) => console.log("[UEF]", ...a);
+  const WARN = (...a) => console.warn("[UEF]", ...a);
+  const ERR = (...a) => console.error("[UEF]", ...a);
 
-(function () {
-  const LMS_HOST = (window.__lmsHost || "").trim();
-  const TOKEN = (window.__token || "").trim();
+  // ----------------------------
+  // Config / Derived URLs
+  // ----------------------------
+  const BASE_URL = window.location.origin;
+  const WIDGET_URL = `${BASE_URL}/widget.html`;
 
-  const DEBUG = true;
+  // LEARN_HOST is best provided by uef-boot.html:
+  //   <script>window.__UEF_LEARN_HOST = "https://mapua-test.blackboard.com";</script>
+  const LEARN_HOST = (
+    window.__UEF_LEARN_HOST ||
+    localStorage.getItem("UEF_LEARN_HOST") ||
+    ""
+  ).trim();
 
-  // Help menu entry (question mark menu)
-  const HELP_PROVIDER_ID = "nf-widget-help";
-  const HELP_PROVIDER_NAME = "NF Widget";
-  const HELP_PROVIDER_TYPE = "auxiliary"; // shows as an extra item in Help menu
-
-  // Optional: set to an ABSOLUTE URL if you want an icon in the Help menu item
-  // Example: `${window.location.origin}/nf-help-icon.png`
-  const HELP_ICON_URL = "";
-
-  // UEF MessagePort from Ultra
-  let messagePort = null;
-
-  // Authorization + setup state
-  let isAuthorized = false;
-  let didPostSubscriptions = false;
-  let didRegisterHelpProvider = false;
-
-  // Portal/panel state
-  let openedPortalId = null;
-  let openingPanel = false;
-  let panelCorrelationId = null;
-
-  function log(...args) {
-    if (DEBUG) console.log("[UEF]", ...args);
-  }
-
-  function warn(...args) {
-    console.warn("[UEF]", ...args);
-  }
-
-  // Persist token for later navigations (optional but helps stability)
+  let LEARN_ORIGIN = "";
   try {
-    if (TOKEN) localStorage.setItem("UEF_BEARER_TOKEN", TOKEN);
+    if (LEARN_HOST) LEARN_ORIGIN = new URL(LEARN_HOST).origin;
   } catch {
     // ignore
   }
 
-  function getToken() {
-    if (TOKEN) return TOKEN;
-    try {
-      return localStorage.getItem("UEF_BEARER_TOKEN") || "";
-    } catch {
-      return "";
-    }
+  // Token comes from uef-boot.html?token=...
+  const qs = new URLSearchParams(window.location.search);
+  const tokenFromUrl = (qs.get("token") || "").trim();
+  if (tokenFromUrl) localStorage.setItem("UEF_USER_TOKEN", tokenFromUrl);
+
+  const TOKEN = (
+    tokenFromUrl ||
+    localStorage.getItem("UEF_USER_TOKEN") ||
+    ""
+  ).trim();
+
+  if (!LEARN_ORIGIN) {
+    WARN("Missing LEARN_ORIGIN. Set window.__UEF_LEARN_HOST in uef-boot.html.");
+    return;
+  }
+  if (!TOKEN) {
+    WARN("Missing TOKEN. uef-boot.html must be called with ?token=...");
+    return;
   }
 
-  function requireLmsHost() {
-    if (!LMS_HOST) {
-      warn("Missing window.__lmsHost. Set it in uef-boot.html.");
-      return false;
-    }
-    return true;
+  // ----------------------------
+  // UEF Port / State
+  // ----------------------------
+  let port = null;
+  let portalId = null;
+  let pendingRender = false;
+
+  function post(msg) {
+    if (!port) return WARN("No MessagePort yet; cannot post:", msg);
+    port.postMessage(msg);
   }
 
-  // Step 1: handshake
-  function sendIntegrationHello() {
-    if (!requireLmsHost()) return;
-    try {
-      // IMPORTANT: targetOrigin should be the origin only (no /*)
-      window.parent.postMessage({ type: "integration:hello" }, LMS_HOST);
-      log("Sent integration:hello to", LMS_HOST);
-    } catch (e) {
-      warn("Failed to post integration:hello", e);
-    }
+  // ----------------------------
+  // Handshake
+  // ----------------------------
+  function startHandshake() {
+    const channel = new MessageChannel();
+
+    // Receive messages from Ultra on port1
+    channel.port1.onmessage = onUltraMessage;
+
+    // Send port2 to parent (Ultra)
+    const hello = { type: "integration:hello" };
+    window.parent.postMessage(hello, LEARN_ORIGIN, [channel.port2]);
+    LOG("Sent integration:hello to", `${LEARN_ORIGIN}/*`);
+
+    // IMPORTANT: In many UEF examples, the first "integration:hello" response
+    // comes in on the port itself, not on window. So we don't rely on window message here.
+    // We treat the port as live immediately.
+    port = channel.port1;
+
+    // Now authorize
+    post({ type: "authorization:authorize", token: TOKEN });
+    LOG("Posted authorization:authorize");
   }
 
-  function postAuthorize() {
-    if (!messagePort) return;
-
-    const token = getToken();
-    if (!token) {
-      warn(
-        "No 3LO bearer token available. Provide ?token=... to uef-boot.html or persist it in localStorage."
-      );
-    }
-
-    messagePort.postMessage({
-      type: "authorization:authorize",
-      token,
-    });
-    log("Posted authorization:authorize");
-  }
-
-  function postSubscriptionsIfNeeded() {
-    if (!messagePort || didPostSubscriptions) return;
-
-    // Subscribe only after auth succeeds to reduce “not authenticated” warnings
-    messagePort.postMessage({
-      type: "event:subscribe",
-      subscriptions: ["portal:new"],
-    });
-
-    didPostSubscriptions = true;
-    log("Subscribed to portal:new");
-  }
-
-  function registerHelpProviderIfNeeded() {
-    if (!messagePort || !isAuthorized || didRegisterHelpProvider) return;
-
-    const payload = {
+  // ----------------------------
+  // Help Provider registration
+  // ----------------------------
+  function registerHelpProvider() {
+    // Adds an item under the (?) help menu without replacing Blackboard help.
+    // registration fields: id, displayName, helpProviderType (auxiliary/primary)
+    // See docs. :contentReference[oaicite:6]{index=6}
+    post({
       type: "help:register",
-      id: HELP_PROVIDER_ID,
-      displayName: HELP_PROVIDER_NAME,
-      providerType: HELP_PROVIDER_TYPE,
-    };
-
-    if (HELP_ICON_URL) payload.iconUrl = HELP_ICON_URL;
-
-    messagePort.postMessage(payload);
-    didRegisterHelpProvider = true;
-    log("Registered Help menu entry:", HELP_PROVIDER_NAME);
+      registration: {
+        id: "nf-widget-help",
+        displayName: "NF Widget",
+        helpProviderType: "auxiliary",
+      },
+    });
+    LOG("Posted help:register (auxiliary)");
   }
 
-  function renderWidgetIntoPortal(portalId) {
-    if (!messagePort) return;
-    const integrationHost = window.location.origin;
+  // ----------------------------
+  // Portal helpers (right-side panel)
+  // ----------------------------
+  function openPanelAndRender() {
+    pendingRender = true;
+    post({ type: "portal:panel" });
+    LOG("Requested portal:panel");
+  }
 
-    messagePort.postMessage({
+  function renderWidget() {
+    if (!portalId) return;
+
+    post({
       type: "portal:render",
       portalId,
-      contents: {
-        tag: "span",
-        props: {
-          style: {
-            display: "flex",
-            height: "100%",
-            width: "100%",
-            flexDirection: "column",
-            alignItems: "stretch",
-            justifyContent: "stretch",
-          },
-        },
-        children: [
-          {
-            tag: "iframe",
-            props: {
-              style: {
-                flex: "1 1 auto",
-                border: "0",
-                width: "100%",
-                height: "100%",
-              },
-              src: `${integrationHost}/widget.html`,
-            },
-          },
-        ],
+      iframe: {
+        src: WIDGET_URL,
+        title: "NF Widget",
       },
     });
 
-    log("Sent portal:render iframe ->", `${integrationHost}/widget.html`);
+    LOG("Posted portal:render iframe ->", WIDGET_URL);
+    pendingRender = false;
   }
 
-  function openPanel() {
-    if (!messagePort) return;
-    if (!isAuthorized) {
-      warn("Tried to open panel before authorization finished.");
-      return;
-    }
-
-    // If already open, just re-render (or you can no-op)
-    if (openedPortalId) {
-      renderWidgetIntoPortal(openedPortalId);
-      return;
-    }
-
-    if (openingPanel) return;
-    openingPanel = true;
-
-    panelCorrelationId = `nf-widget-panel-${Date.now()}`;
-
-    messagePort.postMessage({
-      type: "portal:panel",
-      correlationId: panelCorrelationId,
-      panelType: "small",
-      panelTitle: HELP_PROVIDER_NAME,
-      attributes: {
-        onClose: { callbackId: `${panelCorrelationId}-close` },
-      },
-    });
-
-    log("Requested portal:panel", panelCorrelationId);
-  }
-
-  function ackHelpRequest(correlationId) {
-    if (!messagePort || !correlationId) return;
-    messagePort.postMessage({
-      type: "help:request:response",
-      correlationId,
-    });
-  }
-
-  function onMessageFromUltra(evt) {
+  // ----------------------------
+  // Ultra message handler
+  // ----------------------------
+  function onUltraMessage(evt) {
     const msg = evt?.data;
-    if (!msg || typeof msg.type !== "string") return;
 
-    // Authorization response
-    if (msg.type === "authorization:authorize:response") {
-      const ok =
-        msg.status === "success" ||
-        msg.success === true ||
-        msg.authorized === true;
+    // Always log raw messages during setup (this is the #1 thing that saves time)
+    LOG("From Ultra:", msg);
 
-      if (ok) {
-        isAuthorized = true;
-        log("Authorize OK ✅");
-        postSubscriptionsIfNeeded();
-        registerHelpProviderIfNeeded();
+    if (!msg || typeof msg !== "object") return;
+
+    // ✅ AUTHORIZE RESPONSE IS ALSO "authorization:authorize" (not "...:response") :contentReference[oaicite:7]{index=7}
+    if (msg.type === "authorization:authorize") {
+      if (msg.status === "success") {
+        LOG("Authorize OK ✅");
+
+        // Register help menu item now
+        registerHelpProvider();
       } else {
-        warn("Authorize failed:", msg);
+        ERR("Authorize FAILED:", msg);
       }
       return;
     }
 
-    // Help menu click -> Ultra sends help:request as an event
+    if (msg.type === "authorization:unauthorize") {
+      ERR("Unauthorized:", msg);
+      return;
+    }
+
+    if (msg.type === "help:register:response") {
+      if (msg.status === "success") {
+        LOG(
+          "help:register success ✅ (refresh Ultra shell if you don't see it yet)"
+        );
+      } else {
+        ERR("help:register FAILED:", msg);
+        WARN(
+          "If this fails, your token likely lacks the help scope (ultra:help)."
+        );
+      }
+      return;
+    }
+
+    // Help clicks come in as event:event with eventType help:request :contentReference[oaicite:8]{index=8}
     if (msg.type === "event:event" && msg.eventType === "help:request") {
-      // Only react if it’s OUR help provider entry (objectId should match our id)
-      if (msg.objectId && msg.objectId !== HELP_PROVIDER_ID) return;
+      LOG("help:request received ✅");
+      // Open right panel + render widget
+      openPanelAndRender();
 
-      log("Help requested:", msg);
-
-      // ACK the request (required correlation)
-      ackHelpRequest(msg.correlationId);
-
-      // Open the widget panel when clicked
-      openPanel();
-      return;
-    }
-
-    // Panel response -> gives portalId
-    if (
-      msg.type === "portal:panel:response" &&
-      msg.correlationId === panelCorrelationId
-    ) {
-      openingPanel = false;
-
-      if (msg.status !== "success" || !msg.portalId) {
-        warn("portal:panel:response not successful:", msg);
-        return;
-      }
-
-      openedPortalId = msg.portalId;
-      log("portal:panel success. portalId =", openedPortalId);
-      renderWidgetIntoPortal(openedPortalId);
-      return;
-    }
-
-    // Close callbacks
-    if (msg.type === "portal:callback") {
-      log("portal:callback:", msg);
-      if (
-        typeof msg.callbackId === "string" &&
-        msg.callbackId.endsWith("-close")
-      ) {
-        openedPortalId = null;
-        openingPanel = false;
+      // Some environments expect an ack; keep it minimal.
+      if (msg.correlationId) {
+        post({
+          type: "help:request:response",
+          correlationId: msg.correlationId,
+          status: "success",
+        });
+        LOG("Posted help:request:response");
       }
       return;
     }
 
-    // Other events (optional logging)
-    if (msg.type === "event:event") {
-      log("event:event received:", msg.eventType || msg.event || msg);
+    if (msg.type === "portal:panel:response") {
+      if (msg.status === "success" && msg.portalId) {
+        portalId = msg.portalId;
+        LOG("portal:panel success, portalId =", portalId);
+
+        if (pendingRender) renderWidget();
+      } else {
+        ERR("portal:panel failed:", msg);
+      }
+      return;
+    }
+
+    if (msg.type === "portal:render:response") {
+      if (msg.status === "success") LOG("portal:render success ✅");
+      else ERR("portal:render failed:", msg);
+      return;
     }
   }
 
-  // Receive the handshake response (MessagePort)
-  window.addEventListener(
-    "message",
-    (incomingMessage) => {
-      if (!incomingMessage?.data?.type) return;
-
-      // Strict origin check
-      if (LMS_HOST && incomingMessage.origin !== LMS_HOST) return;
-
-      if (incomingMessage.data.type === "integration:hello") {
-        const port = incomingMessage.ports && incomingMessage.ports[0];
-        if (!port) {
-          warn("integration:hello received but no MessagePort provided");
-          return;
-        }
-
-        messagePort = port;
-        messagePort.onmessage = onMessageFromUltra;
-
-        log("Handshake complete; MessagePort stored");
-        postAuthorize();
-      }
-    },
-    false
-  );
-
-  // Kick off handshake
-  sendIntegrationHello();
+  // Go
+  startHandshake();
 })();
