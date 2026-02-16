@@ -1,393 +1,266 @@
 /**
- * UEF integration script (runs inside Blackboard Ultra).
+ * UEF Integration Script (public/uef.js)
  *
  * Goal:
- * - Register as a Help Provider so you appear under the (?) help menu as an entry.
- * - Open a right-side UEF panel ONLY when the user clicks your help entry.
- * - Render your hosted widget page inside that panel (iframe).
+ * - Register "Noodle Factory" as an AUXILIARY Help Provider (question-mark menu entry)
+ * - Only open the right-side panel + render the widget when the user clicks that entry
  *
  * References:
- * - Help provider register: https://docs.anthology.com/uef-documentation/interfaces/ihelpproviderregistrationrequest.html
- * - Help request event + response: https://docs.anthology.com/uef-documentation/interfaces/ihelpproviderrequest.html
- * - Panel open request/response: https://docs.anthology.com/uef-documentation/interfaces/inewportalpanelrequest.html
- * - Portal render request + standard element: https://docs.anthology.com/uef-documentation/interfaces/iportalrenderrequest.html
+ * - Help provider registration: type 'help:register' :contentReference[oaicite:3]{index=3}
+ * - Help request event: type 'event:event', eventType 'help:request' :contentReference[oaicite:4]{index=4}
+ * - Portal rendering flow: subscribe to portal:new, then portal:panel, then portal:render :contentReference[oaicite:5]{index=5}
  */
 
-/* =====================================================
-   CONFIG
-===================================================== */
+(function () {
+  // ============================================================
+  // CONFIG
+  // ============================================================
+  const TOOL_HOST = window.location.origin; // e.g. https://widget-integ.onrender.com
 
-const INTEGRATION_ID = "noodlefactory-help"; // must be stable; used by help:register
-const INTEGRATION_NAME = "Ask Mappy";
-const ICON_PATH = "/nf-help-icon.png"; // MUST exist in /public so GET /nf-help-icon.png returns 200
+  // Help provider identity shown in Ultra's question-mark menu
+  const HELP_PROVIDER_ID = "noodlefactory-help";
+  const HELP_PROVIDER_NAME = "Noodle Factory";
+  const HELP_PROVIDER_TYPE = "auxiliary"; // shows as a menu entry under the ? help menu :contentReference[oaicite:6]{index=6}
 
-// Stored in local storage by uef-boot.html (or injected via window.__token)
-const TOKEN_STORAGE_KEY = "uef_user_token";
+  // Icon must be publicly reachable via iconUrl
+  const HELP_ICON_URL = `${TOOL_HOST}/nf-help-icon.png`;
 
-/* =====================================================
-   STATE
-===================================================== */
+  // Panel settings
+  const PANEL_CORRELATION_ID = "nf-help-panel";
+  const PANEL_TITLE = "Ask Mappy!"; // You can set "" but Ultra will still show panel chrome
+  const PANEL_TYPE = "small"; // 'small' or 'large' depending on your preference
 
-let messageChannel = null;
-let isAuthorized = false;
-let helpRegistered = false;
+  // What to render inside the portal
+  const WIDGET_PAGE_URL = `${TOOL_HOST}/widget.html`;
 
-let currentPortalId = null;
-let currentPanelCorrelationId = null;
+  // ============================================================
+  // STATE
+  // ============================================================
+  let messageChannel = null;
+  let messagePort = null;
 
-// Used for onClose callback tracking
-let currentCloseCallbackId = null;
+  let portalId = null; // active portal to render into (set on portal:new)
+  let panelOpened = false;
 
-/* =====================================================
-   UTILS
-===================================================== */
-
-function getIntegrationHost() {
-  return `${window.location.protocol}//${window.location.hostname}${
-    window.location.port ? `:${window.location.port}` : ""
-  }`;
-}
-
-function getLmsHost() {
-  // uef-boot.html sets window.__lmsHost
-  if (typeof window.__lmsHost === "string" && window.__lmsHost.trim()) {
-    return window.__lmsHost.trim();
+  // ============================================================
+  // TOKEN HELPERS (matches your existing logic)
+  // ============================================================
+  function getToken() {
+    return localStorage.getItem("uef_user_token") || "";
   }
 
-  // Fallback to referrer origin (best-effort)
-  try {
-    const ref = document.referrer ? new URL(document.referrer) : null;
-    if (ref) return ref.origin;
-  } catch {}
-
-  return "";
-}
-
-function getToken() {
-  // uef-boot.html sets window.__token (and stores it)
-  if (typeof window.__token === "string" && window.__token.trim()) {
-    return window.__token.trim();
-  }
-  const t = localStorage.getItem(TOKEN_STORAGE_KEY);
-  return (t || "").trim();
-}
-
-function randomId(prefix = "id") {
-  return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-}
-
-class LoggedMessageChannel {
-  constructor(port) {
-    this.port = port;
-    this.port.onmessage = this.onMessage.bind(this);
-  }
-  onMessage(event) {
-    try {
-      onMessageFromUltra(event);
-    } catch (e) {
-      console.error("[UEF] onMessageFromUltra error:", e);
-    }
-  }
-  postMessage(message, transfer) {
-    // Keep this log; it makes UEF debugging 100x easier.
-    console.log("[UEF] →", message);
-    this.port.postMessage(message, transfer);
-  }
-}
-
-/* =====================================================
-   HANDSHAKE (integration:hello -> MessagePort)
-===================================================== */
-
-function startHandshake() {
-  const lmsHost = getLmsHost();
-  if (!lmsHost) {
-    console.warn(
-      "[UEF] Missing LMS host. window.__lmsHost not set and referrer unavailable."
-    );
-    return;
+  function saveToken(token) {
+    if (!token) return;
+    localStorage.setItem("uef_user_token", token);
   }
 
-  // UEF docs: post "integration:hello" to parent LMS origin
-  // https://docs.anthology.com/uef-documentation/get-started/integrate-with-ultra.html
-  window.parent.postMessage({ type: "integration:hello" }, `${lmsHost}/*`);
-}
+  // ============================================================
+  // UEF WIRING
+  // ============================================================
+  window.addEventListener("message", (incomingMessage) => {
+    // We only care about the initial hello (MessagePort handoff)
+    const data = incomingMessage?.data;
+    if (!data || typeof data !== "object") return;
 
-// Accept both "integration:hello" and (some environments) "integration:port"
-function onPostMessageReceived(event) {
-  const lmsHost = getLmsHost();
-  if (!lmsHost) return;
-
-  // Strict origin check (avoid grabbing ports from unexpected frames)
-  if (event.origin !== lmsHost) return;
-
-  const msg = event.data || {};
-  if (!msg.type) return;
-
-  const isHandshakeMsg =
-    msg.type === "integration:hello" || msg.type === "integration:port";
-  if (!isHandshakeMsg) return;
-
-  const port = event.ports && event.ports[0];
-  if (!port) {
-    console.warn(
-      "[UEF] Handshake message received but no MessagePort provided:",
-      msg
-    );
-    return;
-  }
-
-  if (messageChannel) {
-    // Avoid noisy warnings; sometimes Ultra re-sends ports during reloads.
-    console.log(
-      "[UEF] Handshake received; MessagePort already set. Ignoring extra port."
-    );
-    return;
-  }
-
-  messageChannel = new LoggedMessageChannel(port);
-  console.log("[UEF] Handshake received; using provided MessagePort.");
-
-  authorize();
-}
-
-/* =====================================================
-   AUTH + HELP PROVIDER REGISTRATION
-===================================================== */
-
-function authorize() {
-  const token = getToken();
-  if (!token) {
-    console.warn(
-      "[UEF] No UEF user token found. Did you launch through /uef-boot.html?"
-    );
-    return;
-  }
-
-  messageChannel.postMessage({
-    type: "authorization:authorize",
-    token,
-  });
-}
-
-function registerHelpProvider() {
-  if (!messageChannel || !isAuthorized || helpRegistered) return;
-
-  const integrationHost = getIntegrationHost();
-  const iconUrl = `${integrationHost}${ICON_PATH}`;
-
-  // Docs: IHelpProviderRegistrationRequest
-  // https://docs.anthology.com/uef-documentation/interfaces/ihelpproviderregistrationrequest.html
-  messageChannel.postMessage({
-    type: "help:register",
-    id: INTEGRATION_ID,
-    displayName: INTEGRATION_NAME,
-    providerType: "auxiliary", // "auxiliary" -> appears as an entry in the (?) help menu
-    iconUrl,
-  });
-}
-
-/* =====================================================
-   PANEL OPEN + RENDER
-===================================================== */
-
-function renderWidgetIntoPortal(portalId) {
-  const integrationHost = getIntegrationHost();
-  const widgetUrl = `${integrationHost}/widget.html`;
-
-  // Docs:
-  // - IPortalRenderRequest: https://docs.anthology.com/uef-documentation/interfaces/iportalrenderrequest.html
-  // - IStandardElement: https://docs.anthology.com/uef-documentation/interfaces/istandardelement.html
-  messageChannel.postMessage({
-    type: "portal:render",
-    portalId,
-    contents: {
-      tag: "div",
-      props: {
-        style: {
-          height: "100%",
-          width: "100%",
-          padding: "0",
-          margin: "0",
-        },
-      },
-      children: [
-        {
-          tag: "iframe",
-          props: {
-            src: widgetUrl,
-            style: {
-              border: "0",
-              height: "100%",
-              width: "100%",
-            },
-          },
-        },
-      ],
-    },
-  });
-}
-
-function ensurePanelOpenAndRendered() {
-  if (!messageChannel || !isAuthorized) return;
-
-  // If we already have a portal, just re-render (useful if your iframe crashed).
-  if (currentPortalId) {
-    renderWidgetIntoPortal(currentPortalId);
-    return;
-  }
-
-  currentPanelCorrelationId = randomId("nf-panel");
-  currentCloseCallbackId = `${currentPanelCorrelationId}-close`;
-
-  // Docs: INewPortalPanelRequest
-  // https://docs.anthology.com/uef-documentation/interfaces/inewportalpanelrequest.html
-  messageChannel.postMessage({
-    type: "portal:panel",
-    correlationId: currentPanelCorrelationId,
-    panelType: "small",
-    panelTitle: INTEGRATION_NAME,
-    attributes: {
-      onClose: { callbackId: currentCloseCallbackId },
-    },
-  });
-}
-
-/* =====================================================
-   HELP REQUEST HANDLER
-===================================================== */
-
-function handleHelpRequest(message) {
-  // Docs: IHelpProviderRequest / IHelpProviderResponse
-  // https://docs.anthology.com/uef-documentation/interfaces/ihelpproviderrequest.html
-  // https://docs.anthology.com/uef-documentation/interfaces/ihelpproviderresponse.html
-
-  const correlationId = message.correlationId;
-
-  console.log("[UEF] help:request received:", {
-    correlationId,
-    currentRouteName: message.currentRouteName,
-    helpUrl: message.helpUrl,
-    timeout: message.timeout,
-  });
-
-  // ACK the help request immediately (UEF expects a response within timeout)
-  messageChannel.postMessage({
-    type: "help:request:response",
-    correlationId,
-  });
-
-  // Then open your panel + render your widget
-  ensurePanelOpenAndRendered();
-}
-
-/* =====================================================
-   MESSAGE ROUTER (FROM ULTRA)
-===================================================== */
-
-function onMessageFromUltra(event) {
-  const message = event.data || {};
-  if (!message.type) return;
-
-  // Always log inbound. Again: makes debugging way easier.
-  console.log("[UEF] ←", message);
-
-  // Successful auth
-  if (message.type === "authorization:authorize") {
-    isAuthorized = true;
-
-    // Optional but harmless: subscribe to portal events (not strictly required for help providers)
-    messageChannel.postMessage({
-      type: "event:subscribe",
-      subscriptions: ["portal:new"],
-    });
-
-    registerHelpProvider();
-    return;
-  }
-
-  // Failed auth
-  if (message.type === "authorization:unauthorize") {
-    console.error("[UEF] Unauthorized:", message.errorInformation);
-    isAuthorized = false;
-    helpRegistered = false;
-    return;
-  }
-
-  // Help provider registration response
-  if (message.type === "help:register") {
-    helpRegistered = message.status === "success";
-    if (helpRegistered) {
+    // Blackboard Ultra will send a handshake; your instance uses integration:hello
+    if (data.type === "integration:hello") {
       console.log(
-        `[UEF] Help provider registered as "${INTEGRATION_NAME}" (auxiliary).`
+        "[UEF] integration:hello received; using provided MessagePort."
       );
-    } else {
-      console.error("[UEF] Help provider registration failed:", message);
+
+      if (!incomingMessage.ports || !incomingMessage.ports[0]) {
+        console.warn("[UEF] No MessagePort provided in integration:hello.");
+        return;
+      }
+
+      messagePort = incomingMessage.ports[0];
+      messageChannel = messagePort;
+
+      messagePort.onmessage = onMessageFromUltra;
+
+      authorizeWithUEF();
     }
-    return;
+  });
+
+  // Kick off handshake to parent window (Ultra)
+  // NOTE: targetOrigin is '*' because Blackboard origin differs per instance.
+  // If you know exact origin, you can lock it down.
+  window.parent.postMessage({ type: "integration:hello" }, "*");
+
+  // ============================================================
+  // AUTH
+  // ============================================================
+  function authorizeWithUEF() {
+    const token = getToken();
+
+    // Request authorization scopes needed for:
+    // - help provider registration (ultra:help)
+    // - portal rendering (ultra:portal)
+    const authRequest = {
+      type: "authorization:authorize",
+      token,
+      auth: ["ultra:help", "ultra:portal"],
+    };
+
+    messageChannel.postMessage(authRequest);
   }
 
-  // Help request events come as event:event with eventType help:request
-  if (message.type === "event:event" && message.eventType === "help:request") {
-    handleHelpRequest(message);
-    return;
-  }
+  function onMessageFromUltra(evt) {
+    const data = evt?.data;
+    if (!data || typeof data !== "object") return;
 
-  // Panel open response
-  if (message.type === "portal:panel:response") {
-    if (
-      !currentPanelCorrelationId ||
-      message.correlationId !== currentPanelCorrelationId
-    ) {
-      return; // ignore other panels
-    }
+    // ------------------------------------------------------------
+    // AUTH RESULT
+    // ------------------------------------------------------------
+    if (data.type === "authorization:authorize") {
+      if (data.status === "success") {
+        console.log("[UEF] Authorized with UEF.");
 
-    if (message.status !== "success") {
-      console.error("[UEF] portal:panel failed:", message);
-      currentPortalId = null;
+        // Some UEF setups return a token; keep your existing behavior
+        if (data.token) saveToken(data.token);
+
+        initializeAfterAuth();
+      } else {
+        console.error("[UEF] Authorization failed:", data);
+      }
       return;
     }
 
-    currentPortalId = message.portalId;
-    console.log("[UEF] Panel opened. portalId =", currentPortalId);
+    // ------------------------------------------------------------
+    // PORTAL EVENTS (portal:new / portal:remove)
+    // Note: subscription is 'portal:new', but the event payload uses eventType 'new'
+    // in many UEF docs/examples. :contentReference[oaicite:7]{index=7}
+    // ------------------------------------------------------------
+    if (data.type === "event:event" && data.portalId && data.eventType) {
+      if (data.eventType === "new") {
+        // We only want to capture a portal after we open our panel
+        if (panelOpened) {
+          portalId = data.portalId;
+          // Render immediately when the portal becomes available
+          renderWidgetIntoPortal(portalId);
+        }
+      }
 
-    renderWidgetIntoPortal(currentPortalId);
-    return;
-  }
-
-  // Portal close callback
-  if (message.type === "portal:callback") {
-    if (message.callbackId === currentCloseCallbackId) {
-      console.log("[UEF] Panel closed.");
-      currentPortalId = null;
-      currentPanelCorrelationId = null;
-      currentCloseCallbackId = null;
+      if (data.eventType === "remove") {
+        if (portalId && data.portalId === portalId) {
+          portalId = null;
+          panelOpened = false;
+        }
+      }
+      return;
     }
-    return;
-  }
 
-  // Render response (useful for debugging blank panel issues)
-  if (message.type === "portal:render:response") {
-    if (message.status !== "success") {
-      console.error(
-        "[UEF] portal:render failed:",
-        message.error,
-        message.errorMessage
-      );
-    } else {
-      console.log(
-        "[UEF] portal:render success for portalId:",
-        message.portalId
-      );
+    // ------------------------------------------------------------
+    // HELP REQUEST (user clicked your help entry in the ? menu)
+    // UEF sends: { type:'event:event', eventType:'help:request', correlationId, ... } :contentReference[oaicite:8]{index=8}
+    // ------------------------------------------------------------
+    if (data.type === "event:event" && data.eventType === "help:request") {
+      console.log("[UEF] Help requested:", data);
+
+      // Respond quickly to acknowledge the help request (recommended by UEF)
+      // Response type is 'help:request:response' and must echo correlationId :contentReference[oaicite:9]{index=9}
+      messageChannel.postMessage({
+        type: "help:request:response",
+        correlationId: data.correlationId,
+      });
+
+      // Open panel + render widget
+      openPanel();
+      return;
     }
-    return;
+
+    // ------------------------------------------------------------
+    // HELP REGISTER RESPONSE (informational)
+    // ------------------------------------------------------------
+    if (data.type === "help:register") {
+      console.log("[UEF] Help provider register response:", data);
+      return;
+    }
+
+    // ------------------------------------------------------------
+    // PORTAL RENDER RESPONSE (informational)
+    // ------------------------------------------------------------
+    if (data.type === "portal:render:response") {
+      if (data.status !== "success") {
+        console.warn("[UEF] portal:render:response non-success:", data);
+      }
+      return;
+    }
   }
-}
 
-/* =====================================================
-   BOOT
-===================================================== */
+  // ============================================================
+  // INIT AFTER AUTH
+  // ============================================================
+  function initializeAfterAuth() {
+    // Subscribe to portal:new so we get a portalId when our panel opens :contentReference[oaicite:10]{index=10}
+    messageChannel.postMessage({
+      type: "event:subscribe",
+      subscriptions: ["portal:new", "portal:remove"],
+    });
 
-window.addEventListener("message", onPostMessageReceived);
+    // Register as an auxiliary help provider (question-mark menu entry) :contentReference[oaicite:11]{index=11}
+    messageChannel.postMessage({
+      type: "help:register",
+      id: HELP_PROVIDER_ID,
+      displayName: HELP_PROVIDER_NAME,
+      providerType: HELP_PROVIDER_TYPE,
+      iconUrl: HELP_ICON_URL,
+    });
 
-startHandshake();
+    console.log(
+      "[UEF] Ready. Widget will open when user clicks the ? menu entry."
+    );
+  }
+
+  // ============================================================
+  // PANEL + RENDER
+  // ============================================================
+  function openPanel() {
+    panelOpened = true;
+
+    messageChannel.postMessage({
+      type: "portal:panel",
+      correlationId: PANEL_CORRELATION_ID,
+      panelType: PANEL_TYPE,
+      panelTitle: PANEL_TITLE,
+      closeable: true,
+    });
+  }
+
+  function renderWidgetIntoPortal(targetPortalId) {
+    if (!targetPortalId) return;
+
+    // Render an iframe that fills the panel.
+    // This is standard portal rendering with a standard element 'iframe'. :contentReference[oaicite:12]{index=12}
+    messageChannel.postMessage({
+      type: "portal:render",
+      portalId: targetPortalId,
+      contents: [
+        {
+          tag: "span",
+          props: {
+            style: {
+              display: "block",
+              width: "100%",
+              height: "100%",
+            },
+          },
+          children: [
+            {
+              tag: "iframe",
+              props: {
+                src: WIDGET_PAGE_URL,
+                style: {
+                  border: "0",
+                  width: "100%",
+                  height: "100%",
+                  display: "block",
+                },
+              },
+            },
+          ],
+        },
+      ],
+    });
+  }
+})();
