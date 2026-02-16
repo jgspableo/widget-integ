@@ -1,30 +1,25 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>Noodle Factory Widget</title>
+    <title>NF widget host page</title>
     <style>
-      html,
-      body {
-        height: 100%;
-        margin: 0;
-      }
-      body {
-        font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial,
-          sans-serif;
-      }
+      html, body { height: 100%; margin: 0; }
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+      .hint { padding: 16px; }
     </style>
   </head>
   <body>
-    <h3 style="padding: 12px; margin: 0">NF widget host page</h3>
+    <div class="hint">
+      <h1>NF widget host page</h1>
+      <p>If this loads on Render, your widget script is fine.</p>
+    </div>
 
     <!--Start of NoodleFactory.ai Widget Script-->
     <script type="text/javascript">
-      var $_Widget = $_Widget || {},
-        $_NFW = $_NFW || {};
+      var $_Widget = $_Widget || {}, $_NFW = $_NFW || {};
       (function () {
-        if (document.getElementById("sw-widget")) return; // prevent duplicates
         var s1 = document.createElement("script"),
           s0 = document.getElementsByTagName("script")[0];
         s1.async = true;

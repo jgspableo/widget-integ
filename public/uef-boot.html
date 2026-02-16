@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>UEF Boot</title>
+  </head>
+  <body>
+    <script>
+      (function () {
+        // You can hardcode your Learn host here for strict origin checks.
+        // If your host changes, update this one line.
+        const LEARN_HOST = "https://mapua-test.blackboard.com";
+
+        // Token comes from the backend redirect: /uef-boot.html?token=...
+        const params = new URLSearchParams(location.search);
+        const token = params.get("token");
+
+        // Provide globals used by uef.js (matches Anthology doc examples)
+        window.__lmsHost = LEARN_HOST;
+        window.__token = token || "";
+
+        // Persist token for retries / reloads
+        if (token) {
+          try {
+            localStorage.setItem("UEF_BEARER_TOKEN", token);
+          } catch (e) {
+            // ignore
+          }
+        } else {
+          // If token isn't present in URL, try localStorage
+          try {
+            const saved = localStorage.getItem("UEF_BEARER_TOKEN");
+            if (saved) window.__token = saved;
+          } catch (e) {
+            // ignore
+          }
+        }
+
+        // Load the UEF integration script
+        const s = document.createElement("script");
+        // cache-bust to avoid stale file inside Ultra iframes during development
+        s.src = "/uef.js?v=" + Date.now();
+        s.async = true;
+        document.head.appendChild(s);
+      })();
+    </script>
+  </body>
+</html>
