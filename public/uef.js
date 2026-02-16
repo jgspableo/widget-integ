@@ -2,105 +2,63 @@
 (() => {
   const LOG_PREFIX = "[UEF]";
 
-  // If your boot page sets window.__lmsHost, we’ll use it; otherwise fall back to your test host.
-  const LMS_HOST = (
+  // Must match the Learn origin you are iframed into.
+  const LEARN_ORIGIN = (
     window.__lmsHost || "https://mapua-test.blackboard.com"
   ).replace(/\/+$/, "");
   const integrationHost = `${location.protocol}//${location.host}`;
 
   // Help Provider config
-  // NOTE: "auxiliary" makes it a menu entry under the (?) Help menu.
   const HELP_PROVIDER_ID = (
     window.__helpProviderId || "noodlefactory-help"
   ).trim();
   const HELP_DISPLAY_NAME = "Noodle Factory";
-  const HELP_PROVIDER_TYPE = "auxiliary";
-  // Host an icon from your own /public (add the file). Keep it HTTPS-accessible.
+  const HELP_PROVIDER_TYPE = "auxiliary"; // shows as an entry in the (?) Help menu
   const HELP_ICON_URL = `${integrationHost}/nf-help-icon.png`;
 
   // Panel + widget config
   const PANEL_PATH = "/widget.html";
   const PANEL_CORRELATION_ID = "nf-widget-panel";
   const PANEL_TITLE = "Noodle Factory Help";
-  const PANEL_TYPE = "small"; // "small" | "medium" | "large"
+  const PANEL_TYPE = "small";
 
-  let messageChannel = null;
+  let uefPort = null;
   let authorized = false;
 
   let portalId = null;
   let widgetRendered = false;
 
-  function log(...args) {
-    console.log(LOG_PREFIX, ...args);
-  }
+  const log = (...a) => console.log(LOG_PREFIX, ...a);
+  const warn = (...a) => console.warn(LOG_PREFIX, ...a);
+  const err = (...a) => console.error(LOG_PREFIX, ...a);
 
-  function warn(...args) {
-    console.warn(LOG_PREFIX, ...args);
-  }
-
-  function err(...args) {
-    console.error(LOG_PREFIX, ...args);
-  }
-
-  function createMessageChannel(url) {
-    const channel = new MessageChannel();
-    channel.port1.start();
-    channel.port2.start();
-
-    channel.port1.onmessage = (event) => {
-      onMessageFromUltra(event);
-    };
-
-    // Give Ultra the other port so it can talk to us
-    window.parent.postMessage(
-      { type: "integration:port", port: channel.port2 },
-      LMS_HOST,
-      [channel.port2]
+  function getBearerToken() {
+    if (window.__token && typeof window.__token === "string")
+      return window.__token;
+    return (
+      localStorage.getItem("uef_user_token") ||
+      localStorage.getItem("UEF_BEARER_TOKEN") ||
+      ""
     );
-
-    return channel.port1;
   }
 
   function postHello() {
-    // This is how your existing integration starts the handshake.
-    window.parent.postMessage({ type: "integration:hello" }, `${LMS_HOST}/*`);
-  }
-
-  function getBearerToken() {
-    // Prefer token from boot
-    if (window.__token && typeof window.__token === "string")
-      return window.__token;
-
-    // Fall back to localStorage keys (your repo used two different keys; support both)
-    const t1 = localStorage.getItem("uef_user_token");
-    if (t1) return t1;
-    const t2 = localStorage.getItem("UEF_BEARER_TOKEN");
-    if (t2) return t2;
-
-    return "";
-  }
-
-  function authorizeWithUltra() {
-    const token = getBearerToken();
-    if (!token) {
-      warn("Missing bearer token; cannot authorize.");
-      return;
-    }
-
-    messageChannel.postMessage({
-      type: "authorization:authorize",
-      token,
-    });
+    // UEF docs / examples commonly show using learn_url + '/*' for the handshake. :contentReference[oaicite:1]{index=1}
+    // If you ever see a browser error about invalid targetOrigin, change this to LEARN_ORIGIN (no /*).
+    window.parent.postMessage(
+      { type: "integration:hello" },
+      `${LEARN_ORIGIN}/*`
+    );
   }
 
   function registerHelpProvider() {
-    if (!messageChannel || !authorized) return;
+    if (!uefPort || !authorized) return;
 
-    messageChannel.postMessage({
+    uefPort.postMessage({
       type: "help:register",
       id: HELP_PROVIDER_ID,
       displayName: HELP_DISPLAY_NAME,
-      providerType: HELP_PROVIDER_TYPE, // "auxiliary"
+      providerType: HELP_PROVIDER_TYPE,
       iconUrl: HELP_ICON_URL,
     });
 
@@ -110,11 +68,10 @@
     });
   }
 
-  function openPanelIfNeeded() {
-    if (!messageChannel || !authorized) return;
+  function openPanel() {
+    if (!uefPort || !authorized) return;
 
-    // Even if already open, re-sending portal:panel is a decent "focus" attempt.
-    messageChannel.postMessage({
+    uefPort.postMessage({
       type: "portal:panel",
       correlationId: PANEL_CORRELATION_ID,
       panelType: PANEL_TYPE,
@@ -122,52 +79,43 @@
     });
   }
 
-  function createWidgetIframeElement() {
-    return {
-      tag: "Iframe",
-      src: `${integrationHost}${PANEL_PATH}`,
-      title: PANEL_TITLE,
-      width: "100%",
-      height: "100%",
-      scrollable: false,
-    };
-  }
-
   function renderWidget() {
-    if (!messageChannel || !portalId) return;
+    if (!uefPort || !portalId) return;
 
-    messageChannel.postMessage({
+    uefPort.postMessage({
       type: "portal:render",
       portalId,
-      contents: createWidgetIframeElement(),
+      contents: {
+        tag: "Iframe",
+        src: `${integrationHost}${PANEL_PATH}`,
+        title: PANEL_TITLE,
+        width: "100%",
+        height: "100%",
+        scrollable: false,
+      },
     });
   }
 
   function handleHelpRequest(msg) {
-    // msg has: correlationId, helpUrl, currentRouteName, timeout, etc.
     log("Received help:request", msg);
 
-    // Open (or focus) the panel and render the widget
-    openPanelIfNeeded();
+    openPanel();
 
-    // IMPORTANT: Respond back using the same correlationId. :contentReference[oaicite:4]{index=4}
-    messageChannel.postMessage({
+    // Respond to the request using the same correlationId. :contentReference[oaicite:2]{index=2}
+    uefPort.postMessage({
       type: "help:request:response",
       correlationId: msg.correlationId,
     });
   }
 
-  function onMessageFromUltra(event) {
-    const data = event.data;
-
+  function onUEFMessage(data) {
     if (!data || !data.type) return;
 
-    // 1) Authorization response
     if (data.type === "authorization:authorize") {
       authorized = true;
       log("Authorized with UEF.");
 
-      // Register the Help menu entry (auxiliary provider). :contentReference[oaicite:5]{index=5}
+      // Help provider registration requires ultra:help entitlement. :contentReference[oaicite:3]{index=3}
       registerHelpProvider();
       return;
     }
@@ -178,33 +126,27 @@
       return;
     }
 
-    // 2) Help provider registration response (same type "help:register", status field). :contentReference[oaicite:6]{index=6}
     if (data.type === "help:register") {
       log("Help provider register response:", data);
       return;
     }
 
-    // 3) Help menu click request arrives as an event occurrence with eventType help:request. :contentReference[oaicite:7]{index=7}
+    // Help menu click comes in as an event occurrence with eventType "help:request".
     if (data.type === "event:event" && data.eventType === "help:request") {
       handleHelpRequest(data);
       return;
     }
 
-    // 4) Panel open response gives us portalId (your original code uses this)
     if (data.type === "portal:panel:response") {
       if (data.correlationId === PANEL_CORRELATION_ID && data.portalId) {
         portalId = data.portalId;
         log("Panel opened, portalId =", portalId);
 
-        // Render once per portal open
-        if (!widgetRendered) {
-          renderWidget();
-        }
+        if (!widgetRendered) renderWidget();
       }
       return;
     }
 
-    // 5) Render response
     if (data.type === "portal:render:response") {
       if (data.portalId === portalId) {
         widgetRendered = true;
@@ -214,20 +156,39 @@
     }
   }
 
-  // Listen for the initial handshake reply
+  // ✅ Correct handshake:
+  // Ultra replies to integration:hello with a MessagePort in event.ports[0]. Use that. :contentReference[oaicite:4]{index=4}
   window.addEventListener("message", (event) => {
-    const data = event.data;
+    if (event.origin !== LEARN_ORIGIN) return;
 
+    const data = event.data;
     if (!data || data.type !== "integration:hello") return;
 
-    // Create the message channel back to Ultra
-    log("integration:hello received; creating message channel.");
-    messageChannel = createMessageChannel(data.url);
+    const port = event.ports && event.ports[0];
+    if (!port) {
+      err(
+        "integration:hello received but no MessagePort provided in event.ports[0]"
+      );
+      return;
+    }
 
-    // Authorize (this will then register help provider)
-    authorizeWithUltra();
+    log("integration:hello received; using provided MessagePort.");
+    uefPort = port;
+
+    uefPort.onmessage = (evt) => onUEFMessage(evt.data);
+    uefPort.start && uefPort.start();
+
+    const token = getBearerToken();
+    if (!token) {
+      warn("Missing bearer token; cannot authorize.");
+      return;
+    }
+
+    uefPort.postMessage({
+      type: "authorization:authorize",
+      token,
+    });
   });
 
-  // Start handshake
   postHello();
 })();
