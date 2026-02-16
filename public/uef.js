@@ -18,7 +18,7 @@
 ===================================================== */
 
 const INTEGRATION_ID = "noodlefactory-help"; // must be stable; used by help:register
-const INTEGRATION_NAME = "Mappy Widget";
+const INTEGRATION_NAME = "Ask Mappy";
 const ICON_PATH = "/nf-help-icon.png"; // MUST exist in /public so GET /nf-help-icon.png returns 200
 
 // Stored in local storage by uef-boot.html (or injected via window.__token)
