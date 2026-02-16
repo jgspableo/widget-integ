@@ -38,7 +38,7 @@ const TOOL_BASE_URL = (process.env.TOOL_BASE_URL || "").trim();
 const LEARN_HOST = (process.env.LEARN_HOST || "").trim().replace(/\/+$/, "");
 const REST_KEY = (process.env.REST_KEY || "").trim();
 const REST_SECRET = (process.env.REST_SECRET || "").trim();
-const CLIENT_ID = (process.env.CLIENT_ID || "").trim();
+const CLIENT_ID = (process.env.LTI_CLIENT_ID || "").trim();
 
 // For 3LO token refresh you MUST include "offline" in the scope.
 // Example: "read offline"
