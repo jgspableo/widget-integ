@@ -1,89 +1,129 @@
-/* public/uef.js */
-/* UEF: open a panel and render widget.html inside it */
+/* global window */
 
-(() => {
-  const LOG_PREFIX = "[UEF]";
-  const LMS_HOST = (
-    window.__lmsHost || "https://mapua-test.blackboard.com"
-  ).replace(/\/+$/, "");
-  const PANEL_PATH = "/widget.html";
-  const PANEL_CORRELATION_ID = "nf-widget-panel-1";
+(function () {
+  const LMS_HOST = (window.__lmsHost || "").trim();
+  const TOKEN = (window.__token || "").trim();
 
-  const log = (...a) => console.log(LOG_PREFIX, ...a);
-  const warn = (...a) => console.warn(LOG_PREFIX, ...a);
-  const err = (...a) => console.error(LOG_PREFIX, ...a);
+  const DEBUG = true;
 
-  const integrationHost = `${window.location.protocol}//${window.location.host}`;
+  // Help menu entry (question mark menu)
+  const HELP_PROVIDER_ID = "nf-widget-help";
+  const HELP_PROVIDER_NAME = "NF Widget";
+  const HELP_PROVIDER_TYPE = "auxiliary"; // shows as an extra item in Help menu
 
-  function loadToken() {
+  // Optional: set to an ABSOLUTE URL if you want an icon in the Help menu item
+  // Example: `${window.location.origin}/nf-help-icon.png`
+  const HELP_ICON_URL = "";
+
+  // UEF MessagePort from Ultra
+  let messagePort = null;
+
+  // Authorization + setup state
+  let isAuthorized = false;
+  let didPostSubscriptions = false;
+  let didRegisterHelpProvider = false;
+
+  // Portal/panel state
+  let openedPortalId = null;
+  let openingPanel = false;
+  let panelCorrelationId = null;
+
+  function log(...args) {
+    if (DEBUG) console.log("[UEF]", ...args);
+  }
+
+  function warn(...args) {
+    console.warn("[UEF]", ...args);
+  }
+
+  // Persist token for later navigations (optional but helps stability)
+  try {
+    if (TOKEN) localStorage.setItem("UEF_BEARER_TOKEN", TOKEN);
+  } catch {
+    // ignore
+  }
+
+  function getToken() {
+    if (TOKEN) return TOKEN;
     try {
-      return localStorage.getItem("uef_user_token") || "";
+      return localStorage.getItem("UEF_BEARER_TOKEN") || "";
     } catch {
       return "";
     }
   }
 
-  function saveToken(t) {
+  function requireLmsHost() {
+    if (!LMS_HOST) {
+      warn("Missing window.__lmsHost. Set it in uef-boot.html.");
+      return false;
+    }
+    return true;
+  }
+
+  // Step 1: handshake
+  function sendIntegrationHello() {
+    if (!requireLmsHost()) return;
     try {
-      if (t) localStorage.setItem("uef_user_token", t);
-    } catch {
-      // ignore (3rd-party storage restrictions)
+      // IMPORTANT: targetOrigin should be the origin only (no /*)
+      window.parent.postMessage({ type: "integration:hello" }, LMS_HOST);
+      log("Sent integration:hello to", LMS_HOST);
+    } catch (e) {
+      warn("Failed to post integration:hello", e);
     }
   }
 
-  // Prefer the token injected by uef-boot.html, fallback to localStorage.
-  const token = window.__token || loadToken();
-  if (window.__token) saveToken(window.__token);
+  function postAuthorize() {
+    if (!messagePort) return;
 
-  let messageChannel = null;
-  let authorized = false;
-  let portalId = null;
-
-  function postHello() {
-    const target = `${LMS_HOST}/*`; // matches UEF docs style
-    log("Sent integration:hello to", target);
-    window.parent.postMessage({ type: "integration:hello" }, target);
-  }
-
-  function sendAuthorize() {
-    if (!messageChannel) return;
+    const token = getToken();
     if (!token) {
       warn(
-        "No token found. uef-boot.html should be redirecting with ?token=..."
+        "No 3LO bearer token available. Provide ?token=... to uef-boot.html or persist it in localStorage."
       );
-      return;
     }
-    messageChannel.postMessage({ type: "authorization:authorize", token });
+
+    messagePort.postMessage({
+      type: "authorization:authorize",
+      token,
+    });
     log("Posted authorization:authorize");
   }
 
-  function subscribeAndOpenPanel() {
-    if (!messageChannel || !authorized) return;
+  function postSubscriptionsIfNeeded() {
+    if (!messagePort || didPostSubscriptions) return;
 
-    messageChannel.postMessage({
+    // Subscribe only after auth succeeds to reduce “not authenticated” warnings
+    messagePort.postMessage({
       type: "event:subscribe",
       subscriptions: ["portal:new"],
     });
-    log("Subscribed to portal:new");
 
-    messageChannel.postMessage({
-      type: "portal:panel",
-      correlationId: PANEL_CORRELATION_ID,
-      panelType: "small",
-      panelTitle: "NF Widget",
-      attributes: {
-        onClose: { callbackId: `${PANEL_CORRELATION_ID}-close` },
-      },
-    });
-    log("Requested portal:panel");
+    didPostSubscriptions = true;
+    log("Subscribed to portal:new");
   }
 
-  function renderPanel() {
-    if (!messageChannel || !portalId) return;
+  function registerHelpProviderIfNeeded() {
+    if (!messagePort || !isAuthorized || didRegisterHelpProvider) return;
 
-    const src = `${integrationHost}${PANEL_PATH}`;
+    const payload = {
+      type: "help:register",
+      id: HELP_PROVIDER_ID,
+      displayName: HELP_PROVIDER_NAME,
+      providerType: HELP_PROVIDER_TYPE,
+    };
 
-    messageChannel.postMessage({
+    if (HELP_ICON_URL) payload.iconUrl = HELP_ICON_URL;
+
+    messagePort.postMessage(payload);
+    didRegisterHelpProvider = true;
+    log("Registered Help menu entry:", HELP_PROVIDER_NAME);
+  }
+
+  function renderWidgetIntoPortal(portalId) {
+    if (!messagePort) return;
+    const integrationHost = window.location.origin;
+
+    messagePort.postMessage({
       type: "portal:render",
       portalId,
       contents: {
@@ -102,86 +142,161 @@
           {
             tag: "iframe",
             props: {
-              src,
               style: {
                 flex: "1 1 auto",
+                border: "0",
                 width: "100%",
                 height: "100%",
-                border: "0",
               },
+              src: `${integrationHost}/widget.html`,
             },
           },
         ],
       },
     });
 
-    log("Posted portal:render iframe ->", src);
+    log("Sent portal:render iframe ->", `${integrationHost}/widget.html`);
   }
 
-  function onMessageFromUltra(message) {
-    const data = message?.data || {};
-
-    // Keep this while debugging so you can see what Ultra is sending back.
-    log("From Ultra:", data);
-
-    if (data.type === "authorization:authorize") {
-      authorized = true;
-      log("Authorize OK ✅");
-      subscribeAndOpenPanel();
+  function openPanel() {
+    if (!messagePort) return;
+    if (!isAuthorized) {
+      warn("Tried to open panel before authorization finished.");
       return;
     }
 
-    if (data.type === "authorization:unauthorize") {
-      authorized = false;
-      err("Authorize FAILED ❌", data.errorInformation || data);
+    // If already open, just re-render (or you can no-op)
+    if (openedPortalId) {
+      renderWidgetIntoPortal(openedPortalId);
       return;
     }
 
+    if (openingPanel) return;
+    openingPanel = true;
+
+    panelCorrelationId = `nf-widget-panel-${Date.now()}`;
+
+    messagePort.postMessage({
+      type: "portal:panel",
+      correlationId: panelCorrelationId,
+      panelType: "small",
+      panelTitle: HELP_PROVIDER_NAME,
+      attributes: {
+        onClose: { callbackId: `${panelCorrelationId}-close` },
+      },
+    });
+
+    log("Requested portal:panel", panelCorrelationId);
+  }
+
+  function ackHelpRequest(correlationId) {
+    if (!messagePort || !correlationId) return;
+    messagePort.postMessage({
+      type: "help:request:response",
+      correlationId,
+    });
+  }
+
+  function onMessageFromUltra(evt) {
+    const msg = evt?.data;
+    if (!msg || typeof msg.type !== "string") return;
+
+    // Authorization response
+    if (msg.type === "authorization:authorize:response") {
+      const ok =
+        msg.status === "success" ||
+        msg.success === true ||
+        msg.authorized === true;
+
+      if (ok) {
+        isAuthorized = true;
+        log("Authorize OK ✅");
+        postSubscriptionsIfNeeded();
+        registerHelpProviderIfNeeded();
+      } else {
+        warn("Authorize failed:", msg);
+      }
+      return;
+    }
+
+    // Help menu click -> Ultra sends help:request as an event
+    if (msg.type === "event:event" && msg.eventType === "help:request") {
+      // Only react if it’s OUR help provider entry (objectId should match our id)
+      if (msg.objectId && msg.objectId !== HELP_PROVIDER_ID) return;
+
+      log("Help requested:", msg);
+
+      // ACK the request (required correlation)
+      ackHelpRequest(msg.correlationId);
+
+      // Open the widget panel when clicked
+      openPanel();
+      return;
+    }
+
+    // Panel response -> gives portalId
     if (
-      data.type === "portal:panel:response" &&
-      data.correlationId === PANEL_CORRELATION_ID
+      msg.type === "portal:panel:response" &&
+      msg.correlationId === panelCorrelationId
     ) {
-      if (data.status !== "success") {
-        err("portal:panel failed:", data);
+      openingPanel = false;
+
+      if (msg.status !== "success" || !msg.portalId) {
+        warn("portal:panel:response not successful:", msg);
         return;
       }
-      portalId = data.portalId;
-      log("portal:panel success, portalId =", portalId);
-      renderPanel();
+
+      openedPortalId = msg.portalId;
+      log("portal:panel success. portalId =", openedPortalId);
+      renderWidgetIntoPortal(openedPortalId);
       return;
     }
 
-    if (data.type === "portal:render:response") {
-      if (data.status !== "success") err("portal:render failed:", data);
-      else log("portal:render success ✅");
+    // Close callbacks
+    if (msg.type === "portal:callback") {
+      log("portal:callback:", msg);
+      if (
+        typeof msg.callbackId === "string" &&
+        msg.callbackId.endsWith("-close")
+      ) {
+        openedPortalId = null;
+        openingPanel = false;
+      }
       return;
     }
 
-    if (data.type === "portal:callback") {
-      log("portal callback:", data);
-      return;
+    // Other events (optional logging)
+    if (msg.type === "event:event") {
+      log("event:event received:", msg.eventType || msg.event || msg);
     }
   }
 
-  // Step 1: wait for Ultra handshake message
+  // Receive the handshake response (MessagePort)
   window.addEventListener(
     "message",
-    (evt) => {
-      if (!evt?.data || evt.data.type !== "integration:hello") return;
-      if (!evt.ports || !evt.ports[0]) {
-        err("Handshake response missing MessagePort");
-        return;
+    (incomingMessage) => {
+      if (!incomingMessage?.data?.type) return;
+
+      // Strict origin check
+      if (LMS_HOST && incomingMessage.origin !== LMS_HOST) return;
+
+      if (incomingMessage.data.type === "integration:hello") {
+        const port = incomingMessage.ports && incomingMessage.ports[0];
+        if (!port) {
+          warn("integration:hello received but no MessagePort provided");
+          return;
+        }
+
+        messagePort = port;
+        messagePort.onmessage = onMessageFromUltra;
+
+        log("Handshake complete; MessagePort stored");
+        postAuthorize();
       }
-
-      messageChannel = evt.ports[0];
-      messageChannel.onmessage = onMessageFromUltra;
-
-      log("Handshake complete; MessagePort stored");
-      sendAuthorize();
     },
     false
   );
 
   // Kick off handshake
-  postHello();
+  sendIntegrationHello();
 })();
