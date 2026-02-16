@@ -1,0 +1,13 @@
+{
+  "name": "mapua-uef-widget",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}

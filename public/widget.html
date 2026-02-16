@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Noodle Factory Widget</title>
+    <style>
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+      }
+      body {
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial,
+          sans-serif;
+      }
+    </style>
+  </head>
+  <body>
+    <h3 style="padding: 12px; margin: 0">NF widget host page</h3>
+
+    <!--Start of NoodleFactory.ai Widget Script-->
+    <script type="text/javascript">
+      var $_Widget = $_Widget || {},
+        $_NFW = $_NFW || {};
+      (function () {
+        if (document.getElementById("sw-widget")) return; // prevent duplicates
+        var s1 = document.createElement("script"),
+          s0 = document.getElementsByTagName("script")[0];
+        s1.async = true;
+        s1.src =
+          "https://portalapi.noodlefactory.ai/api/v1/widget/widget-sdk/A60CF5EFD2705979/widget.js";
+        s1.charset = "UTF-8";
+        s1.setAttribute("crossorigin", "*");
+        s1.setAttribute("id", "sw-widget");
+        s1.onload = function () {
+          $_NFW.initialize();
+        };
+        s0.parentNode.insertBefore(s1, s0);
+      })();
+    </script>
+    <!--End of NoodleFactory.ai Widget Script-->
+  </body>
+</html>
