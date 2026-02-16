@@ -7,43 +7,48 @@
   </head>
   <body>
     <script>
-      (function () {
-        // You can hardcode your Learn host here for strict origin checks.
-        // If your host changes, update this one line.
-        const LEARN_HOST = "https://mapua-test.blackboard.com";
+      /**
+       * This page is the entry point used by your placement URL.
+       * It captures the Learn OAuth2 tokens from the redirect query params,
+       * stores them, then loads /uef.js which connects to Ultra via postMessage.
+       */
 
-        // Token comes from the backend redirect: /uef-boot.html?token=...
-        const params = new URLSearchParams(location.search);
-        const token = params.get("token");
+      const qs = new URLSearchParams(location.search);
 
-        // Provide globals used by uef.js (matches Anthology doc examples)
-        window.__lmsHost = LEARN_HOST;
-        window.__token = token || "";
+      // Backwards compatible: accept either token= or access_token=
+      const accessToken = qs.get("token") || qs.get("access_token") || "";
+      const refreshToken = qs.get("refresh_token") || "";
+      const expiresIn = Number(qs.get("expires_in") || "0"); // seconds
+      const learnHost = qs.get("learn") || "";
 
-        // Persist token for retries / reloads
-        if (token) {
-          try {
-            localStorage.setItem("UEF_BEARER_TOKEN", token);
-          } catch (e) {
-            // ignore
-          }
-        } else {
-          // If token isn't present in URL, try localStorage
-          try {
-            const saved = localStorage.getItem("UEF_BEARER_TOKEN");
-            if (saved) window.__token = saved;
-          } catch (e) {
-            // ignore
-          }
-        }
+      if (learnHost) {
+        // Used by uef.js for postMessage origin matching
+        localStorage.setItem("UEF_LEARN_HOST", learnHost);
+        window.__learnHost = learnHost;
+      }
 
-        // Load the UEF integration script
-        const s = document.createElement("script");
-        // cache-bust to avoid stale file inside Ultra iframes during development
-        s.src = "/uef.js?v=" + Date.now();
-        s.async = true;
-        document.head.appendChild(s);
-      })();
+      if (accessToken) {
+        // Keep the legacy key (if any code depends on it)
+        localStorage.setItem("UEF_BEARER_TOKEN", accessToken);
+
+        // The key uef.js uses
+        localStorage.setItem("uef_user_token", accessToken);
+        window.__token = accessToken;
+      }
+
+      if (refreshToken) {
+        localStorage.setItem("uef_refresh_token", refreshToken);
+      }
+
+      if (expiresIn > 0) {
+        const expiresAt = Date.now() + expiresIn * 1000;
+        localStorage.setItem("uef_token_expires_at", String(expiresAt));
+      }
+
+      // Load the integration script (cache-bust to avoid stale JS during dev)
+      const s = document.createElement("script");
+      s.src = `/uef.js?v=${Date.now()}`;
+      document.body.appendChild(s);
     </script>
   </body>
 </html>
