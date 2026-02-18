@@ -3,30 +3,26 @@
  *
  * Goal (your request):
  * - Show "Ask Mappy" in the LEFT base navigation (global rail)
- * - When user clicks it, OPEN a RIGHT-SIDE PANEL and load your widget (widget.html) in an iframe.
- * - Keep the (?) Help menu entry (with your custom icon) and make it open the same panel.
+ * - Make it look like native nav items (Marks, Courses, etc.)
+ * - When user clicks it, OPEN a RIGHT-SIDE PANEL and load widget.html in an iframe.
+ * - Keep the (?) Help menu entry and make it open the same panel.
  *
- * Key UEF details:
- * - Newer UEF typings expose `initialContents` (not `contents`) for what renders inside the base-nav entry.
- * - Route events include `routeName`, so we can detect when user navigates to our route.
- * - You must subscribe to events via `event:subscribe` after successful authorization.
+ * Notes:
+ * - Base nav register supports `initialContents`
+ * - Click callbacks use `props.onClick.callbackId` and return via `portal:callback`
  */
 
 const CFG = {
   // Help provider
   helpProviderId: "noodlefactory-help",
   displayName: "Ask Mappy",
-  providerType: "auxiliary", // shows under (?) help menu
+  providerType: "auxiliary",
 
-  // Base nav (left rail)
-  // Route name for the left-rail entry.
-  // UEF docs show this as an arbitrary string (example: "myIntegration").
+  // Base nav
   baseNavRouteName: "ask-mappy",
-  // Some Learn instances may emit route events with a `base.` prefix.
-  // We handle both to be safe.
   baseNavAltRouteName: "base.ask-mappy",
 
-  // Static assets served by your integration host (Render)
+  // Assets
   iconPath: "/nf-help-icon.png",
   widgetPath: "/widget.html",
 
@@ -48,9 +44,11 @@ let portalId = null;
 let panelCorrelationId = null;
 let closeCallbackId = null;
 
-// We intentionally do NOT gate repeated opens.
-// Ultra may emit multiple route events, and users may click a selected nav item again.
-// `openPanel()` is idempotent (re-renders if already open), so this is safe.
+// Base-nav portal slot
+let baseNavButtonPortalId = null;
+
+// Callback ids
+const BASE_NAV_OPEN_CALLBACK_ID = "ask-mappy-open";
 
 /* ------------------------- helpers ------------------------- */
 
@@ -103,6 +101,70 @@ function send(message) {
   port.postMessage(message);
 }
 
+/* ------------------------- base-nav contents ------------------------- */
+
+function buildBaseNavButtonContents() {
+  // Styling is intentionally inline to mimic native items without relying on private MUI classnames.
+  return {
+    tag: "button",
+    props: {
+      type: "button",
+      "aria-label": CFG.displayName,
+      onClick: { callbackId: BASE_NAV_OPEN_CALLBACK_ID, mode: "sync" },
+      style: {
+        all: "unset",
+        boxSizing: "border-box",
+        cursor: "pointer",
+        width: "100%",
+        height: "38px",
+        display: "flex",
+        alignItems: "center",
+        gap: "12px",
+        padding: "0 16px",
+        color: "inherit",
+      },
+    },
+    children: [
+      {
+        tag: "img",
+        props: {
+          src: getIconUrl(),
+          alt: "",
+          style: {
+            width: "18px",
+            height: "18px",
+            display: "block",
+            flex: "0 0 auto",
+          },
+        },
+      },
+      {
+        tag: "span",
+        props: {
+          style: {
+            fontSize: "14px",
+            lineHeight: "20px",
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+          },
+        },
+        children: CFG.displayName,
+      },
+    ],
+  };
+}
+
+function renderBaseNavButton() {
+  if (!baseNavButtonPortalId) return;
+
+  send({
+    type: "portal:render",
+    portalId: baseNavButtonPortalId,
+    contents: buildBaseNavButtonContents(),
+  });
+}
+
 /* ------------------------- handshake ------------------------- */
 
 function startHandshake() {
@@ -131,14 +193,10 @@ window.addEventListener("message", (event) => {
     return;
   }
 
-  if (port) {
-    logOut("MessagePort already set; ignoring extra port.");
-    return;
-  }
+  if (port) return;
 
   port = p;
   port.onmessage = onPortMessage;
-  logOut("Handshake complete; MessagePort acquired.");
 
   authorize();
 });
@@ -159,7 +217,13 @@ function authorize() {
 function subscribeEvents() {
   send({
     type: "event:subscribe",
-    subscriptions: ["route", "portal:new", "portal:remove"],
+    subscriptions: [
+      "route",
+      "portal:new",
+      "portal:remove",
+      "click",
+      "help:request",
+    ],
   });
 }
 
@@ -179,61 +243,11 @@ function registerHelpProvider() {
 function registerBaseNav() {
   if (baseNavRegistered) return;
 
-  // IMPORTANT:
-  // In current UEF typings, IBaseNavigationRegistrationRequest does NOT include a `contents` field.
-  // Instead, it supports `initialContents` (optional) for what should be rendered inside the
-  // left-nav entry. If you send only `contents`, Learn will still register the slot (so you see
-  // an empty gap), but it will render nothing.
-  //
-  // We'll provide an icon + label block inside `initialContents`.
-  const navEntryContents = {
-    // Use a Link so the nav item is guaranteed clickable across Learn versions.
-    // (ILinkElement expects `props.to`. Some older docs/examples also show `to` at the root,
-    // so we provide both for compatibility.)
-    tag: "Link",
-    to: CFG.baseNavRouteName,
-    props: {
-      to: CFG.baseNavRouteName,
-      // Minimal styling so the entry looks like other items without relying on private MUI classes.
-      style: {
-        display: "flex",
-        alignItems: "center",
-        gap: "12px",
-        width: "100%",
-        textDecoration: "none",
-        color: "inherit",
-      },
-    },
-    children: [
-      {
-        tag: "img",
-        props: {
-          src: getIconUrl(),
-          alt: CFG.displayName,
-          style: { width: "20px", height: "20px" },
-        },
-      },
-      {
-        tag: "span",
-        props: {
-          style: {
-            fontSize: "14px",
-            lineHeight: "20px",
-            whiteSpace: "nowrap",
-          },
-        },
-        children: CFG.displayName,
-      },
-    ],
-  };
-
   send({
     type: "basenav:register",
     displayName: CFG.displayName,
     routeName: CFG.baseNavRouteName,
-
-    // What renders in the left-nav entry (fixes the "empty spot" issue)
-    initialContents: navEntryContents,
+    initialContents: buildBaseNavButtonContents(),
   });
 }
 
@@ -295,6 +309,36 @@ function handleHelpRequest(msg) {
   openPanel("help-menu");
 }
 
+function handlePortalNew(msg) {
+  if (msg.selector === "base.navigation.button") {
+    baseNavButtonPortalId = msg.portalId;
+    renderBaseNavButton();
+  }
+}
+
+function handlePortalRemove(msg) {
+  if (msg.portalId && msg.portalId === baseNavButtonPortalId) {
+    baseNavButtonPortalId = null;
+  }
+}
+
+function handlePortalCallback(msg) {
+  const callbackId = msg.callbackId;
+  if (!callbackId) return;
+
+  if (callbackId === BASE_NAV_OPEN_CALLBACK_ID) {
+    openPanel("base-nav-click");
+    return;
+  }
+
+  if (closeCallbackId && callbackId === closeCallbackId) {
+    logOut("Panel closed.");
+    portalId = null;
+    panelCorrelationId = null;
+    closeCallbackId = null;
+  }
+}
+
 /* ------------------------- port message router ------------------------- */
 
 function onPortMessage(event) {
@@ -329,21 +373,22 @@ function onPortMessage(event) {
     return;
   }
 
-  // Some UEF versions may deliver help requests as a top-level message.
   if (msg.type === "help:request") {
     handleHelpRequest(msg);
     return;
   }
 
   if (msg.type === "event:event") {
-    if (msg.eventType === "route") {
-      handleRouteEvent(msg);
-      return;
-    }
-    if (msg.eventType === "help:request") {
-      handleHelpRequest(msg);
-      return;
-    }
+    if (msg.eventType === "route") return handleRouteEvent(msg);
+    if (msg.eventType === "help:request") return handleHelpRequest(msg);
+    if (msg.eventType === "portal:new") return handlePortalNew(msg);
+    if (msg.eventType === "portal:remove" || msg.eventType === "portal:removed")
+      return handlePortalRemove(msg);
+    return;
+  }
+
+  if (msg.type === "portal:callback") {
+    handlePortalCallback(msg);
     return;
   }
 
@@ -361,16 +406,6 @@ function onPortMessage(event) {
     portalId = msg.portalId;
     logOut("Panel opened. portalId =", portalId);
     renderWidget(portalId);
-    return;
-  }
-
-  if (msg.type === "portal:callback") {
-    if (msg.callbackId === closeCallbackId) {
-      logOut("Panel closed.");
-      portalId = null;
-      panelCorrelationId = null;
-      closeCallbackId = null;
-    }
     return;
   }
 }
