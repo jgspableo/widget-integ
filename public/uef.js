@@ -7,341 +7,355 @@
  * - Keep the (?) Help menu entry (with your custom icon) and make it open the same panel.
  *
  * Key UEF details:
- * - Base nav registration expects a "Link" element with a top-level `to` field (NOT props.to).
- *   See docs example for basenav:register. :contentReference[oaicite:2]{index=2}
+ * - Base nav registration example uses a Link element in `contents` so the nav entry is clickable/visible.
+ * - Route events include `routeName`, so we can detect when user navigates to our route.
+ * - You must subscribe to events via `event:subscribe` after successful authorization.
  */
 
-(() => {
-  const CFG = {
-    learnHost: window.__lmsHost || "https://mapua-test.blackboard.com",
-    tokenStorageKey: "uef_user_token",
-    displayName: "Ask Mappy",
+const CFG = {
+  // Help provider
+  helpProviderId: "noodlefactory-help",
+  displayName: "Ask Mappy",
+  providerType: "auxiliary", // shows under (?) help menu
 
-    helpProviderId: "noodlefactory-help",
+  // Base nav (left rail)
+  baseNavRouteName: "ask-mappy",
 
-    // Base navigation route for left-rail entry
-    baseNavRouteName: "ask-mappy",
+  // Static assets served by your integration host (Render)
+  iconPath: "/nf-help-icon.png",
+  widgetPath: "/widget.html",
 
-    // Panel config
-    panelType: "small",
-    panelTargetPortalId: "nf-panel-root", // optional: depends on Learn/UEF version
-    widgetUrlPath: "/widget.html",
-    iconUrlPath: "/nf-help-icon.png",
-  };
+  // Token storage key (set by uef-boot.html)
+  // Keep this in-sync with public/uef-boot.html (currently uses "UEF_BEARER_TOKEN")
+  tokenStorageKey: "UEF_BEARER_TOKEN",
 
-  // ----------------------------
-  // State
-  // ----------------------------
-  let messagePort = null;
+  // Panel config
+  panelType: "small",
+  panelTitle: "Ask Mappy",
+};
 
-  let authed = false;
+let port = null;
+let authorized = false;
 
-  let helpRegistered = false;
-  let baseNavRegistered = false;
+let helpRegistered = false;
+let baseNavRegistered = false;
 
-  let panelOpen = false;
-  let panelPortalId = null;
-  let panelCloseCallbackId = null;
+let portalId = null;
+let panelCorrelationId = null;
+let closeCallbackId = null;
 
-  // ----------------------------
-  // Utilities
-  // ----------------------------
-  const log = (...args) => console.log("[UEF]", ...args);
-  const warn = (...args) => console.warn("[UEF]", ...args);
-  const err = (...args) => console.error("[UEF]", ...args);
+// gate to avoid repeated opens on multiple route events
+let openedFromBaseNav = false;
 
-  function getIntegrationOrigin() {
-    const { protocol, hostname, port } = window.location;
-    return `${protocol}//${hostname}${port ? `:${port}` : ""}`;
+/* ------------------------- helpers ------------------------- */
+
+function getIntegrationOrigin() {
+  return `${window.location.protocol}//${window.location.hostname}${
+    window.location.port ? `:${window.location.port}` : ""
+  }`;
+}
+
+function getIconUrl() {
+  return `${getIntegrationOrigin()}${CFG.iconPath}`;
+}
+
+function getWidgetUrl() {
+  return `${getIntegrationOrigin()}${CFG.widgetPath}`;
+}
+
+function getLmsHost() {
+  if (typeof window.__lmsHost === "string" && window.__lmsHost.trim()) {
+    return window.__lmsHost.trim();
+  }
+  try {
+    const ref = document.referrer ? new URL(document.referrer) : null;
+    if (ref) return ref.origin;
+  } catch {}
+  return "";
+}
+
+function getToken() {
+  if (typeof window.__token === "string" && window.__token.trim()) {
+    return window.__token.trim();
+  }
+  return (localStorage.getItem(CFG.tokenStorageKey) || "").trim();
+}
+
+function rid(prefix) {
+  return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function logOut(msg, obj) {
+  if (obj !== undefined) console.log(`[UEF] ${msg}`, obj);
+  else console.log(`[UEF] ${msg}`);
+}
+
+/* --------------------- message send wrapper --------------------- */
+
+function send(message) {
+  if (!port) return;
+  logOut("→", message);
+  port.postMessage(message);
+}
+
+/* ------------------------- handshake ------------------------- */
+
+function startHandshake() {
+  const lmsHost = getLmsHost();
+  if (!lmsHost) {
+    console.warn("[UEF] Missing LMS host (window.__lmsHost not set).");
+    return;
+  }
+  window.parent.postMessage({ type: "integration:hello" }, `${lmsHost}/*`);
+}
+
+window.addEventListener("message", (event) => {
+  const lmsHost = getLmsHost();
+  if (!lmsHost) return;
+  if (event.origin !== lmsHost) return;
+
+  const data = event.data || {};
+  if (!data.type) return;
+
+  if (data.type !== "integration:hello" && data.type !== "integration:port")
+    return;
+
+  const p = event.ports && event.ports[0];
+  if (!p) {
+    console.warn("[UEF] Handshake message received but no MessagePort.");
+    return;
   }
 
-  function getWidgetUrl() {
-    return `${getIntegrationOrigin()}${CFG.widgetUrlPath}`;
+  if (port) {
+    logOut("MessagePort already set; ignoring extra port.");
+    return;
   }
 
-  function getIconUrl() {
-    return `${getIntegrationOrigin()}${CFG.iconUrlPath}`;
-  }
+  port = p;
+  port.onmessage = onPortMessage;
+  logOut("Handshake complete; MessagePort acquired.");
 
-  function getToken() {
-    if (typeof window.__token === "string" && window.__token.trim()) {
-      return window.__token.trim();
-    }
+  authorize();
+});
 
-    // Primary storage key used by this script
-    const v1 = (localStorage.getItem(CFG.tokenStorageKey) || "").trim();
-    if (v1) return v1;
+/* ------------------------- auth + subscribe ------------------------- */
 
-    // Compatibility with uef-boot.html (stores token under this key)
-    const v2 = (localStorage.getItem("UEF_BEARER_TOKEN") || "").trim();
-    return v2;
-  }
-
-  function makeCorrelationId(prefix = "id") {
-    return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  }
-
-  function send(msg) {
-    if (!messagePort) {
-      warn("send() called before messagePort is ready:", msg);
-      return;
-    }
-    messagePort.postMessage(msg);
-    log("→", msg);
-  }
-
-  // ----------------------------
-  // Handshake / Auth
-  // ----------------------------
-  function startHandshake() {
-    // Note: docs have mixed examples of integration-hello vs integration:hello in different places.
-    // Your current instance is clearly working with the colon version.
-    window.parent.postMessage(
-      { type: "integration:hello" },
-      `${CFG.learnHost}/*`
+function authorize() {
+  const token = getToken();
+  if (!token) {
+    console.warn(
+      "[UEF] No UEF token found. Ensure /uef-boot.html ran and stored it."
     );
+    return;
   }
+  send({ type: "authorization:authorize", token });
+}
 
-  function authorize() {
-    const token = getToken();
-    if (!token) {
-      warn("No OAuth token found. Did /uef-boot.html receive ?token=... ?");
-      return;
-    }
+function subscribeEvents() {
+  send({
+    type: "event:subscribe",
+    subscriptions: ["route", "portal:new", "portal:remove"],
+  });
+}
 
-    send({
-      type: "authorization:authorize",
-      token,
-    });
-  }
+/* ------------------------- registrations ------------------------- */
 
-  function subscribeEvents() {
-    send({
-      type: "event:subscribe",
-      subscriptions: ["route", "portal:new", "portal:remove"],
-    });
-  }
+function registerHelpProvider() {
+  if (helpRegistered) return;
+  send({
+    type: "help:register",
+    id: CFG.helpProviderId,
+    displayName: CFG.displayName,
+    providerType: CFG.providerType,
+    iconUrl: getIconUrl(),
+  });
+}
 
-  // ----------------------------
-  // Help Provider Registration
-  // ----------------------------
-  function registerHelpProvider() {
-    if (helpRegistered) return;
+function registerBaseNav() {
+  if (baseNavRegistered) return;
 
-    send({
-      type: "help:register",
-      id: CFG.helpProviderId,
-      displayName: CFG.displayName,
-      providerType: "auxiliary",
-      iconUrl: getIconUrl(),
-    });
-  }
+  send({
+    type: "basenav:register",
+    displayName: CFG.displayName,
+    routeName: CFG.baseNavRouteName,
 
-  // ----------------------------
-  // Base Nav Registration (LEFT RAIL)
-  // ----------------------------
-  function registerBaseNav() {
-    if (baseNavRegistered) return;
+    // Left-rail clickable entry
+    contents: {
+      tag: "Link",
+      // UEF expects Link's `to` at the top-level (not inside `props`).
+      // See IBaseNavigationRegistrationRequest example.
+      to: CFG.baseNavRouteName,
+      children: CFG.displayName,
+    },
 
-    send({
-      type: "basenav:register",
-      displayName: CFG.displayName,
-      routeName: CFG.baseNavRouteName,
+    // Route page content (keep it light; panel is the real UI)
+    initialContents: {
+      tag: "div",
+      props: { style: { padding: "16px", fontFamily: "inherit" } },
+      children: [
+        {
+          tag: "h2",
+          props: { style: { margin: "0 0 8px 0" } },
+          children: ["Opening Ask Mappy…"],
+        },
+        {
+          tag: "p",
+          props: { style: { margin: "0", opacity: "0.8" } },
+          children: [
+            "If the panel did not open, refresh the page and try again.",
+          ],
+        },
+      ],
+    },
+  });
+}
 
-      // Left-rail clickable entry
-      // IMPORTANT: For tag: "Link", UEF expects `to` at the top level (not inside props).
-      // If you send `{ props: { to: ... } }`, Learn will still reserve a slot in the nav
-      // but render the label as blank (what you're seeing). :contentReference[oaicite:3]{index=3}
-      contents: {
-        tag: "Link",
-        to: CFG.baseNavRouteName,
-        children: CFG.displayName,
+/* ------------------------- panel open + render ------------------------- */
+
+function renderWidget(targetPortalId) {
+  send({
+    type: "portal:render",
+    portalId: targetPortalId,
+    contents: {
+      tag: "div",
+      props: {
+        style: { height: "100%", width: "100%", padding: "0", margin: "0" },
       },
-
-      // Route page content (keep it light; panel is the real UI)
-      // Note: UEF standard element children must be string OR element[] (not string[]). :contentReference[oaicite:4]{index=4}
-      initialContents: {
-        tag: "div",
-        props: { style: { padding: "16px", fontFamily: "inherit" } },
-        children: [
-          {
-            tag: "h2",
-            props: { style: { margin: "0 0 8px 0" } },
-            children: "Opening Ask Mappy…",
-          },
-          {
-            tag: "p",
-            props: { style: { margin: "0", opacity: "0.8" } },
-            children:
-              "If the panel did not open, refresh the page and try again.",
-          },
-        ],
-      },
-    });
-  }
-
-  // ----------------------------
-  // Panel Open + Render
-  // ----------------------------
-  function openPanel() {
-    if (panelOpen) {
-      // If already open, just re-render to be safe
-      if (panelPortalId) renderWidget(panelPortalId);
-      return;
-    }
-
-    panelOpen = true;
-    panelPortalId = null;
-
-    panelCloseCallbackId = makeCorrelationId("panel-close");
-
-    send({
-      type: "portal:panel",
-      // selector is optional/implementation-dependent; keeping what you had
-      selector: "base.messages",
-      panelType: CFG.panelType,
-      panelTitle: CFG.displayName,
-      targetPortalId: CFG.panelTargetPortalId,
-      attributes: {
-        onClose: { callbackId: panelCloseCallbackId },
-      },
-    });
-  }
-
-  function renderWidget(portalId) {
-    send({
-      type: "portal:render",
-      portalId,
-      contents: {
-        tag: "div",
-        props: {
-          style: {
-            height: "100%",
-            width: "100%",
-            padding: "0",
-            margin: "0",
+      children: [
+        {
+          tag: "iframe",
+          props: {
+            src: getWidgetUrl(),
+            style: { border: "0", height: "100%", width: "100%" },
           },
         },
-        children: [
-          {
-            tag: "iframe",
-            props: {
-              src: getWidgetUrl(),
-              style: {
-                border: "0",
-                width: "100%",
-                height: "100%",
-              },
-            },
-          },
-        ],
-      },
-    });
+      ],
+    },
+  });
+}
+
+function openPanel(reason) {
+  if (!authorized) return;
+
+  if (portalId) {
+    logOut(`Panel already open; re-render (${reason}).`);
+    renderWidget(portalId);
+    return;
   }
 
-  // ----------------------------
-  // Event Handlers
-  // ----------------------------
-  function handleRouteEvent(msg) {
-    // When user navigates to our base nav route, open the panel
-    if (msg.routeName === CFG.baseNavRouteName) {
-      log("Route matched Ask Mappy:", msg.routeName);
-      openPanel();
+  panelCorrelationId = rid("ask-mappy-panel");
+  closeCallbackId = `${panelCorrelationId}-close`;
+
+  send({
+    type: "portal:panel",
+    correlationId: panelCorrelationId,
+    panelType: CFG.panelType,
+    panelTitle: CFG.panelTitle,
+    attributes: { onClose: { callbackId: closeCallbackId } },
+  });
+}
+
+/* ------------------------- handlers ------------------------- */
+
+function handleRouteEvent(msg) {
+  if (msg.routeName !== CFG.baseNavRouteName) {
+    openedFromBaseNav = false;
+    return;
+  }
+
+  if (openedFromBaseNav) return;
+  openedFromBaseNav = true;
+
+  openPanel("basenav-route");
+}
+
+function handleHelpRequest(msg) {
+  send({ type: "help:request:response", correlationId: msg.correlationId });
+  openPanel("help-menu");
+}
+
+/* ------------------------- port message router ------------------------- */
+
+function onPortMessage(event) {
+  const msg = event.data || {};
+  if (!msg.type) return;
+
+  logOut("←", msg);
+
+  if (msg.type === "authorization:authorize") {
+    authorized = true;
+    subscribeEvents();
+    registerHelpProvider();
+    registerBaseNav();
+    return;
+  }
+
+  if (msg.type === "authorization:unauthorize") {
+    authorized = false;
+    helpRegistered = false;
+    baseNavRegistered = false;
+    console.error("[UEF] Unauthorized:", msg.errorInformation || msg);
+    return;
+  }
+
+  if (msg.type === "help:register") {
+    helpRegistered = msg.status === "success";
+    return;
+  }
+
+  if (msg.type === "basenav:register") {
+    baseNavRegistered = msg.status === "success";
+    return;
+  }
+
+  // When a user selects our Help Provider entry, Ultra sends HELP_REQUEST_TYPE ("help:request").
+  // We must respond with HELP_RESPONSE_TYPE ("help:request:response") using the same correlationId.
+  if (msg.type === "help:request") {
+    handleHelpRequest(msg);
+    return;
+  }
+
+  if (msg.type === "event:event") {
+    if (msg.eventType === "route") {
+      handleRouteEvent(msg);
+      return;
     }
-  }
-
-  function handlePortalNew(msg) {
-    // When the panel is created, Learn emits portal:new. We'll use the portalId to render.
-    if (!panelOpen) return;
-
-    // If Learn provides a portalId, capture it and render into it.
-    if (msg.portalId && !panelPortalId) {
-      panelPortalId = msg.portalId;
-      log("Captured panel portalId:", panelPortalId);
-      renderWidget(panelPortalId);
+    // Backwards-compat fallback: some older examples treat help requests as an eventType.
+    if (msg.eventType === "help:request") {
+      handleHelpRequest(msg);
+      return;
     }
+    return;
   }
 
-  function handlePortalRemove(msg) {
-    // If our panel closes, reset state.
-    if (panelPortalId && msg.portalId === panelPortalId) {
-      log("Panel removed:", msg.portalId);
-      panelOpen = false;
-      panelPortalId = null;
-      panelCloseCallbackId = null;
+  if (msg.type === "portal:panel:response") {
+    if (!panelCorrelationId || msg.correlationId !== panelCorrelationId) return;
+
+    if (msg.status !== "success") {
+      console.error("[UEF] portal:panel failed:", msg);
+      portalId = null;
+      panelCorrelationId = null;
+      closeCallbackId = null;
+      return;
     }
+
+    portalId = msg.portalId;
+    logOut("Panel opened. portalId =", portalId);
+    renderWidget(portalId);
+    return;
   }
 
-  // ----------------------------
-  // Message listeners
-  // ----------------------------
-  function onWindowMessage(incoming) {
-    // Only accept messages from Learn host
-    if (!incoming || incoming.origin !== CFG.learnHost) return;
-
-    // On initial handshake, Learn sends a MessagePort via incoming.ports[0]
-    const t = incoming?.data?.type;
-    if (t === "integration:hello" && incoming.ports && incoming.ports[0]) {
-      messagePort = incoming.ports[0];
-      messagePort.onmessage = onPortMessage;
-
-      log("MessagePort established.");
-      authorize();
+  if (msg.type === "portal:callback") {
+    if (msg.callbackId === closeCallbackId) {
+      logOut("Panel closed.");
+      portalId = null;
+      panelCorrelationId = null;
+      closeCallbackId = null;
     }
+    return;
   }
+}
 
-  function onPortMessage(e) {
-    const msg = e?.data;
-    if (!msg || !msg.type) return;
+/* ------------------------- boot ------------------------- */
 
-    // The console in your screenshot is basically these objects.
-    log("←", msg);
-
-    switch (msg.type) {
-      case "authorization:authorize":
-        authed = true;
-        subscribeEvents();
-        registerHelpProvider();
-        registerBaseNav();
-        break;
-
-      case "help:request":
-        // Clicking the Help menu item should trigger this
-        openPanel();
-        break;
-
-      case "help:register":
-        if (msg.status === "success") helpRegistered = true;
-        break;
-
-      case "basenav:register":
-        if (msg.status === "success") baseNavRegistered = true;
-        break;
-
-      case "event:event":
-        if (msg.eventType === "route") handleRouteEvent(msg);
-        if (msg.eventType === "portal:new") handlePortalNew(msg);
-        if (msg.eventType === "portal:remove") handlePortalRemove(msg);
-        break;
-
-      case "portal:callback":
-        // handle close callback, if emitted
-        if (msg.callbackId && msg.callbackId === panelCloseCallbackId) {
-          log("Panel close callback received.");
-          panelOpen = false;
-          panelPortalId = null;
-          panelCloseCallbackId = null;
-        }
-        break;
-
-      default:
-        break;
-    }
-  }
-
-  // ----------------------------
-  // Boot
-  // ----------------------------
-  window.addEventListener("message", onWindowMessage);
-  startHandshake();
-})();
+startHandshake();
