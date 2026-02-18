@@ -1,32 +1,45 @@
 /**
  * UEF integration script (runs inside Blackboard Ultra).
  *
- * Goal:
- * - Register as a Help Provider so you appear under the (?) help menu as an entry.
- * - Open a right-side UEF panel ONLY when the user clicks your help entry.
- * - Render your hosted widget page inside that panel (iframe).
+ * What this version does:
+ * 1) Registers a Help menu entry (with icon) -> opens a right-side panel containing your widget iframe.
+ * 2) Registers a Base Navigation left-rail route ("Ask Mappy").
+ *    - The route page itself shows a lightweight "Opening..." placeholder (NOT the widget).
+ *    - When the user navigates to that route, we open the right-side panel and render the widget iframe there.
  *
- * References:
- * - Help provider register: https://docs.anthology.com/uef-documentation/interfaces/ihelpproviderregistrationrequest.html
- * - Help request event + response: https://docs.anthology.com/uef-documentation/interfaces/ihelpproviderrequest.html
- * - Panel open request/response: https://docs.anthology.com/uef-documentation/interfaces/inewportalpanelrequest.html
- * - Portal render request + standard element: https://docs.anthology.com/uef-documentation/interfaces/iportalrenderrequest.html
+ * Key UEF references:
+ * - basenav:register request (displayName, routeName, initialContents) :contentReference[oaicite:4]{index=4}
+ * - route events (event:event with eventType 'route') :contentReference[oaicite:5]{index=5}
+ * - event subscriptions (event:subscribe) :contentReference[oaicite:6]{index=6}
+ * - help:register request includes iconUrl :contentReference[oaicite:7]{index=7}
+ * - portal workflow (portal:panel -> portal:render) :contentReference[oaicite:8]{index=8}
  */
 
 /* =====================================================
    CONFIG
 ===================================================== */
 
-const INTEGRATION_ID = "noodlefactory-help"; // must be stable; used by help:register
+const INTEGRATION_ID = "noodlefactory-help"; // stable id for help:register
 const INTEGRATION_NAME = "Ask Mappy";
-const ICON_PATH = "/nf-help-icon.png"; // MUST exist in /public so GET /nf-help-icon.png returns 200
+const ICON_PATH = "/nf-help-icon.png"; // must be publicly reachable from your hosting domain
 
-// Base navigation registration (left global rail)
-const BASE_NAV_ROUTE_NAME = "ask-mappy"; // must be stable; used by basenav:register
+// Base navigation (left rail) route
+const BASE_NAV_ROUTE_NAME = "ask-mappy"; // must be stable & unique
 const BASE_NAV_DISPLAY_NAME = INTEGRATION_NAME;
 
-// Stored in local storage by uef-boot.html (or injected via window.__token)
+// Where to load your widget from (served by your tool host)
+const WIDGET_PATH = "/widget.html";
+
+// Token storage key used by your uef-boot.html
 const TOKEN_STORAGE_KEY = "uef_user_token";
+
+// Behavior toggles
+const OPEN_PANEL_WHEN_BASE_NAV_ROUTE_ENTERED = true; // left nav click -> open panel
+const OPEN_PANEL_WHEN_HELP_MENU_CLICKED = true; // (?) help entry -> open panel
+
+// Panel options
+const PANEL_TYPE = "small"; // "small" or "full" (depends on UEF support)
+const PANEL_TITLE = INTEGRATION_NAME;
 
 /* =====================================================
    STATE
@@ -34,15 +47,16 @@ const TOKEN_STORAGE_KEY = "uef_user_token";
 
 let messageChannel = null;
 let isAuthorized = false;
-let helpRegistered = false;
 
+let helpRegistered = false;
 let baseNavRegistered = false;
 
 let currentPortalId = null;
 let currentPanelCorrelationId = null;
-
-// Used for onClose callback tracking
 let currentCloseCallbackId = null;
+
+// used to prevent spamming panel-open on repeated route events
+let openedFromBaseNavThisVisit = false;
 
 /* =====================================================
    UTILS
@@ -55,12 +69,12 @@ function getIntegrationHost() {
 }
 
 function getLmsHost() {
-  // uef-boot.html sets window.__lmsHost
+  // uef-boot.html typically sets window.__lmsHost
   if (typeof window.__lmsHost === "string" && window.__lmsHost.trim()) {
     return window.__lmsHost.trim();
   }
 
-  // Fallback to referrer origin (best-effort)
+  // fallback to referrer origin if possible
   try {
     const ref = document.referrer ? new URL(document.referrer) : null;
     if (ref) return ref.origin;
@@ -70,12 +84,11 @@ function getLmsHost() {
 }
 
 function getToken() {
-  // uef-boot.html sets window.__token (and stores it)
+  // uef-boot.html may set window.__token
   if (typeof window.__token === "string" && window.__token.trim()) {
     return window.__token.trim();
   }
-  const t = localStorage.getItem(TOKEN_STORAGE_KEY);
-  return (t || "").trim();
+  return (localStorage.getItem(TOKEN_STORAGE_KEY) || "").trim();
 }
 
 function randomId(prefix = "id") {
@@ -95,7 +108,6 @@ class LoggedMessageChannel {
     }
   }
   postMessage(message, transfer) {
-    // Keep this log; it makes UEF debugging 100x easier.
     console.log("[UEF] →", message);
     this.port.postMessage(message, transfer);
   }
@@ -108,65 +120,53 @@ class LoggedMessageChannel {
 function startHandshake() {
   const lmsHost = getLmsHost();
   if (!lmsHost) {
-    console.warn(
-      "[UEF] Missing LMS host. window.__lmsHost not set and referrer unavailable."
-    );
+    console.warn("[UEF] Missing LMS host (window.__lmsHost not set).");
     return;
   }
 
-  // UEF docs: post "integration:hello" to parent LMS origin
-  // https://docs.anthology.com/uef-documentation/get-started/integrate-with-ultra.html
+  // Send hello to Ultra to receive the MessagePort back.
+  // Message channel handshake flow is documented in UEF start docs. :contentReference[oaicite:9]{index=9}
   window.parent.postMessage({ type: "integration:hello" }, `${lmsHost}/*`);
 }
 
-// Accept both "integration:hello" and (some environments) "integration:port"
 function onPostMessageReceived(event) {
   const lmsHost = getLmsHost();
   if (!lmsHost) return;
 
-  // Strict origin check (avoid grabbing ports from unexpected frames)
+  // strict origin check
   if (event.origin !== lmsHost) return;
 
   const msg = event.data || {};
   if (!msg.type) return;
 
-  const isHandshakeMsg =
-    msg.type === "integration:hello" || msg.type === "integration:port";
-  if (!isHandshakeMsg) return;
+  // Ultra provides a MessagePort in event.ports[0]
+  if (msg.type !== "integration:hello" && msg.type !== "integration:port") return;
 
   const port = event.ports && event.ports[0];
   if (!port) {
-    console.warn(
-      "[UEF] Handshake message received but no MessagePort provided:",
-      msg
-    );
+    console.warn("[UEF] Handshake received but no MessagePort found:", msg);
     return;
   }
 
   if (messageChannel) {
-    // Avoid noisy warnings; sometimes Ultra re-sends ports during reloads.
-    console.log(
-      "[UEF] Handshake received; MessagePort already set. Ignoring extra port."
-    );
+    console.log("[UEF] MessagePort already set; ignoring extra port.");
     return;
   }
 
   messageChannel = new LoggedMessageChannel(port);
-  console.log("[UEF] Handshake received; using provided MessagePort.");
+  console.log("[UEF] Handshake complete; MessagePort acquired.");
 
   authorize();
 }
 
 /* =====================================================
-   AUTH + HELP PROVIDER REGISTRATION
+   AUTH + SUBSCRIPTIONS
 ===================================================== */
 
 function authorize() {
   const token = getToken();
   if (!token) {
-    console.warn(
-      "[UEF] No UEF user token found. Did you launch through /uef-boot.html?"
-    );
+    console.warn("[UEF] No user token found. Ensure /uef-boot.html ran and stored it.");
     return;
   }
 
@@ -176,19 +176,32 @@ function authorize() {
   });
 }
 
+function subscribeToEvents() {
+  if (!messageChannel || !isAuthorized) return;
+
+  // Subscribing to route events lets us detect when user navigates to our BaseNav route. :contentReference[oaicite:10]{index=10}
+  messageChannel.postMessage({
+    type: "event:subscribe",
+    subscriptions: ["route", "route:changing", "portal:new", "portal:remove"],
+  });
+}
+
+/* =====================================================
+   HELP PROVIDER + BASE NAV REGISTRATION
+===================================================== */
+
 function registerHelpProvider() {
   if (!messageChannel || !isAuthorized || helpRegistered) return;
 
   const integrationHost = getIntegrationHost();
   const iconUrl = `${integrationHost}${ICON_PATH}`;
 
-  // Docs: IHelpProviderRegistrationRequest
-  // https://docs.anthology.com/uef-documentation/interfaces/ihelpproviderregistrationrequest.html
+  // help:register supports iconUrl and providerType. :contentReference[oaicite:11]{index=11}
   messageChannel.postMessage({
     type: "help:register",
     id: INTEGRATION_ID,
     displayName: INTEGRATION_NAME,
-    providerType: "auxiliary", // "auxiliary" -> appears as an entry in the (?) help menu
+    providerType: "auxiliary",
     iconUrl,
   });
 }
@@ -196,38 +209,32 @@ function registerHelpProvider() {
 function registerBaseNavigationRoute() {
   if (!messageChannel || !isAuthorized || baseNavRegistered) return;
 
-  const integrationHost = getIntegrationHost();
-  const widgetUrl = `${integrationHost}/widget.html`;
-
-  // Docs: IBaseNavigationRegistrationRequest
-  // https://docs.anthology.com/uef-documentation/interfaces/ibasenavigationregistrationrequest.html
-  // initialContents uses IStandardElement (iframe is supported)
-  // https://docs.anthology.com/uef-documentation/interfaces/istandardelement.html
+  // basenav:register supports displayName, routeName, initialContents (no icon field). :contentReference[oaicite:12]{index=12}
   messageChannel.postMessage({
     type: "basenav:register",
     displayName: BASE_NAV_DISPLAY_NAME,
     routeName: BASE_NAV_ROUTE_NAME,
+
+    // IMPORTANT: Keep this lightweight.
+    // We are NOT embedding the widget here anymore; we open the panel on route entry instead.
     initialContents: {
       tag: "div",
       props: {
         style: {
-          height: "100%",
-          width: "100%",
-          padding: "0",
-          margin: "0",
+          padding: "16px",
+          fontFamily: "inherit",
         },
       },
       children: [
         {
-          tag: "iframe",
-          props: {
-            src: widgetUrl,
-            style: {
-              border: "0",
-              height: "100%",
-              width: "100%",
-            },
-          },
+          tag: "h2",
+          props: { style: { margin: "0 0 8px 0" } },
+          children: ["Opening Ask Mappy…"],
+        },
+        {
+          tag: "p",
+          props: { style: { margin: "0", opacity: "0.8" } },
+          children: ["If nothing opens, check popups/third-party blocking and refresh."],
         },
       ],
     },
@@ -240,11 +247,9 @@ function registerBaseNavigationRoute() {
 
 function renderWidgetIntoPortal(portalId) {
   const integrationHost = getIntegrationHost();
-  const widgetUrl = `${integrationHost}/widget.html`;
+  const widgetUrl = `${integrationHost}${WIDGET_PATH}`;
 
-  // Docs:
-  // - IPortalRenderRequest: https://docs.anthology.com/uef-documentation/interfaces/iportalrenderrequest.html
-  // - IStandardElement: https://docs.anthology.com/uef-documentation/interfaces/istandardelement.html
+  // Render an iframe into the portal using portal:render. :contentReference[oaicite:13]{index=13}
   messageChannel.postMessage({
     type: "portal:render",
     portalId,
@@ -275,25 +280,25 @@ function renderWidgetIntoPortal(portalId) {
   });
 }
 
-function ensurePanelOpenAndRendered() {
+function ensurePanelOpenAndRendered(reason = "unknown") {
   if (!messageChannel || !isAuthorized) return;
 
-  // If we already have a portal, just re-render (useful if your iframe crashed).
+  // If already open, just re-render to ensure iframe is alive.
   if (currentPortalId) {
+    console.log(`[UEF] Panel already open; re-rendering (reason=${reason}).`);
     renderWidgetIntoPortal(currentPortalId);
     return;
   }
 
-  currentPanelCorrelationId = randomId("nf-panel");
+  currentPanelCorrelationId = randomId("mappy-panel");
   currentCloseCallbackId = `${currentPanelCorrelationId}-close`;
 
-  // Docs: INewPortalPanelRequest
-  // https://docs.anthology.com/uef-documentation/interfaces/inewportalpanelrequest.html
+  // Open a panel via portal:panel, then wait for portal:panel:response. :contentReference[oaicite:14]{index=14}
   messageChannel.postMessage({
     type: "portal:panel",
     correlationId: currentPanelCorrelationId,
-    panelType: "small",
-    panelTitle: INTEGRATION_NAME,
+    panelType: PANEL_TYPE,
+    panelTitle: PANEL_TITLE,
     attributes: {
       onClose: { callbackId: currentCloseCallbackId },
     },
@@ -301,31 +306,40 @@ function ensurePanelOpenAndRendered() {
 }
 
 /* =====================================================
-   HELP REQUEST HANDLER
+   EVENT HANDLERS
 ===================================================== */
 
 function handleHelpRequest(message) {
-  // Docs: IHelpProviderRequest / IHelpProviderResponse
-  // https://docs.anthology.com/uef-documentation/interfaces/ihelpproviderrequest.html
-  // https://docs.anthology.com/uef-documentation/interfaces/ihelpproviderresponse.html
-
+  // ACK help request fast, then open panel. :contentReference[oaicite:15]{index=15}
   const correlationId = message.correlationId;
 
-  console.log("[UEF] help:request received:", {
-    correlationId,
-    currentRouteName: message.currentRouteName,
-    helpUrl: message.helpUrl,
-    timeout: message.timeout,
-  });
-
-  // ACK the help request immediately (UEF expects a response within timeout)
   messageChannel.postMessage({
     type: "help:request:response",
     correlationId,
   });
 
-  // Then open your panel + render your widget
-  ensurePanelOpenAndRendered();
+  if (OPEN_PANEL_WHEN_HELP_MENU_CLICKED) {
+    ensurePanelOpenAndRendered("help");
+  }
+}
+
+function handleRouteEvent(message) {
+  // Route event payload contains routeName. :contentReference[oaicite:16]{index=16}
+  const routeName = message.routeName;
+
+  // reset gating if user is not on our route
+  if (routeName !== BASE_NAV_ROUTE_NAME) {
+    openedFromBaseNavThisVisit = false;
+    return;
+  }
+
+  if (!OPEN_PANEL_WHEN_BASE_NAV_ROUTE_ENTERED) return;
+
+  // prevent repeated opens if multiple route events fire while on the same route
+  if (openedFromBaseNavThisVisit) return;
+
+  openedFromBaseNavThisVisit = true;
+  ensurePanelOpenAndRendered("basenav-route");
 }
 
 /* =====================================================
@@ -336,61 +350,63 @@ function onMessageFromUltra(event) {
   const message = event.data || {};
   if (!message.type) return;
 
-  // Always log inbound. Again: makes debugging way easier.
   console.log("[UEF] ←", message);
 
-  // Successful auth
+  // Authorization success
   if (message.type === "authorization:authorize") {
     isAuthorized = true;
 
-    // Optional but harmless: subscribe to portal events (not strictly required for help providers)
-    messageChannel.postMessage({
-      type: "event:subscribe",
-      subscriptions: ["portal:new"],
-    });
+    subscribeToEvents(); // includes route subscriptions :contentReference[oaicite:17]{index=17}
 
     registerHelpProvider();
     registerBaseNavigationRoute();
     return;
   }
 
-  // Failed auth
+  // Authorization failure
   if (message.type === "authorization:unauthorize") {
     console.error("[UEF] Unauthorized:", message.errorInformation);
     isAuthorized = false;
     helpRegistered = false;
+    baseNavRegistered = false;
     return;
   }
 
-  // Help provider registration response
+  // Registration responses
   if (message.type === "help:register") {
     helpRegistered = message.status === "success";
-    if (helpRegistered) {
-      console.log(
-        `[UEF] Help provider registered as "${INTEGRATION_NAME}" (auxiliary).`
-      );
-    } else {
-      console.error("[UEF] Help provider registration failed:", message);
-    }
+    console.log(
+      helpRegistered
+        ? `[UEF] Help provider registered as "${INTEGRATION_NAME}".`
+        : "[UEF] Help provider registration failed."
+    );
     return;
   }
 
-  // Base navigation registration response
   if (message.type === "basenav:register") {
     baseNavRegistered = message.status === "success";
-    if (baseNavRegistered) {
-      console.log(
-        `[UEF] Base navigation route registered as "${BASE_NAV_DISPLAY_NAME}" (routeName="${BASE_NAV_ROUTE_NAME}").`
-      );
-    } else {
-      console.error("[UEF] Base navigation registration failed:", message);
-    }
+    console.log(
+      baseNavRegistered
+        ? `[UEF] Base nav route registered "${BASE_NAV_DISPLAY_NAME}" (routeName="${BASE_NAV_ROUTE_NAME}").`
+        : "[UEF] Base nav registration failed."
+    );
     return;
   }
 
-  // Help request events come as event:event with eventType help:request
-  if (message.type === "event:event" && message.eventType === "help:request") {
-    handleHelpRequest(message);
+  // Telemetry/event stream
+  if (message.type === "event:event") {
+    // help menu click comes as help:request events
+    if (message.eventType === "help:request") {
+      handleHelpRequest(message);
+      return;
+    }
+
+    // route events fire when navigation completes :contentReference[oaicite:18]{index=18}
+    if (message.eventType === "route") {
+      handleRouteEvent(message);
+      return;
+    }
+
     return;
   }
 
@@ -400,7 +416,7 @@ function onMessageFromUltra(event) {
       !currentPanelCorrelationId ||
       message.correlationId !== currentPanelCorrelationId
     ) {
-      return; // ignore other panels
+      return;
     }
 
     if (message.status !== "success") {
@@ -416,7 +432,7 @@ function onMessageFromUltra(event) {
     return;
   }
 
-  // Portal close callback
+  // Panel close callback
   if (message.type === "portal:callback") {
     if (message.callbackId === currentCloseCallbackId) {
       console.log("[UEF] Panel closed.");
@@ -427,19 +443,12 @@ function onMessageFromUltra(event) {
     return;
   }
 
-  // Render response (useful for debugging blank panel issues)
+  // Render response (debugging)
   if (message.type === "portal:render:response") {
     if (message.status !== "success") {
-      console.error(
-        "[UEF] portal:render failed:",
-        message.error,
-        message.errorMessage
-      );
+      console.error("[UEF] portal:render failed:", message.error, message.errorMessage);
     } else {
-      console.log(
-        "[UEF] portal:render success for portalId:",
-        message.portalId
-      );
+      console.log("[UEF] portal:render success for portalId:", message.portalId);
     }
     return;
   }
@@ -450,5 +459,4 @@ function onMessageFromUltra(event) {
 ===================================================== */
 
 window.addEventListener("message", onPostMessageReceived);
-
 startHandshake();
