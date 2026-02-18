@@ -21,6 +21,10 @@ const INTEGRATION_ID = "noodlefactory-help"; // must be stable; used by help:reg
 const INTEGRATION_NAME = "Ask Mappy";
 const ICON_PATH = "/nf-help-icon.png"; // MUST exist in /public so GET /nf-help-icon.png returns 200
 
+// Base navigation registration (left global rail)
+const BASE_NAV_ROUTE_NAME = "ask-mappy"; // must be stable; used by basenav:register
+const BASE_NAV_DISPLAY_NAME = INTEGRATION_NAME;
+
 // Stored in local storage by uef-boot.html (or injected via window.__token)
 const TOKEN_STORAGE_KEY = "uef_user_token";
 
@@ -31,6 +35,8 @@ const TOKEN_STORAGE_KEY = "uef_user_token";
 let messageChannel = null;
 let isAuthorized = false;
 let helpRegistered = false;
+
+let baseNavRegistered = false;
 
 let currentPortalId = null;
 let currentPanelCorrelationId = null;
@@ -187,6 +193,47 @@ function registerHelpProvider() {
   });
 }
 
+function registerBaseNavigationRoute() {
+  if (!messageChannel || !isAuthorized || baseNavRegistered) return;
+
+  const integrationHost = getIntegrationHost();
+  const widgetUrl = `${integrationHost}/widget.html`;
+
+  // Docs: IBaseNavigationRegistrationRequest
+  // https://docs.anthology.com/uef-documentation/interfaces/ibasenavigationregistrationrequest.html
+  // initialContents uses IStandardElement (iframe is supported)
+  // https://docs.anthology.com/uef-documentation/interfaces/istandardelement.html
+  messageChannel.postMessage({
+    type: "basenav:register",
+    displayName: BASE_NAV_DISPLAY_NAME,
+    routeName: BASE_NAV_ROUTE_NAME,
+    initialContents: {
+      tag: "div",
+      props: {
+        style: {
+          height: "100%",
+          width: "100%",
+          padding: "0",
+          margin: "0",
+        },
+      },
+      children: [
+        {
+          tag: "iframe",
+          props: {
+            src: widgetUrl,
+            style: {
+              border: "0",
+              height: "100%",
+              width: "100%",
+            },
+          },
+        },
+      ],
+    },
+  });
+}
+
 /* =====================================================
    PANEL OPEN + RENDER
 ===================================================== */
@@ -303,6 +350,7 @@ function onMessageFromUltra(event) {
     });
 
     registerHelpProvider();
+    registerBaseNavigationRoute();
     return;
   }
 
@@ -323,6 +371,19 @@ function onMessageFromUltra(event) {
       );
     } else {
       console.error("[UEF] Help provider registration failed:", message);
+    }
+    return;
+  }
+
+  // Base navigation registration response
+  if (message.type === "basenav:register") {
+    baseNavRegistered = message.status === "success";
+    if (baseNavRegistered) {
+      console.log(
+        `[UEF] Base navigation route registered as "${BASE_NAV_DISPLAY_NAME}" (routeName="${BASE_NAV_ROUTE_NAME}").`
+      );
+    } else {
+      console.error("[UEF] Base navigation registration failed:", message);
     }
     return;
   }
