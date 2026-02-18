@@ -7,7 +7,7 @@
  * - Keep the (?) Help menu entry (with your custom icon) and make it open the same panel.
  *
  * Key UEF details:
- * - Base nav registration example uses a Link element in `contents` so the nav entry is clickable/visible.
+ * - Newer UEF typings expose `initialContents` (not `contents`) for what renders inside the base-nav entry.
  * - Route events include `routeName`, so we can detect when user navigates to our route.
  * - You must subscribe to events via `event:subscribe` after successful authorization.
  */
@@ -179,22 +179,61 @@ function registerHelpProvider() {
 function registerBaseNav() {
   if (baseNavRegistered) return;
 
+  // IMPORTANT:
+  // In current UEF typings, IBaseNavigationRegistrationRequest does NOT include a `contents` field.
+  // Instead, it supports `initialContents` (optional) for what should be rendered inside the
+  // left-nav entry. If you send only `contents`, Learn will still register the slot (so you see
+  // an empty gap), but it will render nothing.
+  //
+  // We'll provide an icon + label block inside `initialContents`.
+  const navEntryContents = {
+    // Use a Link so the nav item is guaranteed clickable across Learn versions.
+    // (ILinkElement expects `props.to`. Some older docs/examples also show `to` at the root,
+    // so we provide both for compatibility.)
+    tag: "Link",
+    to: CFG.baseNavRouteName,
+    props: {
+      to: CFG.baseNavRouteName,
+      // Minimal styling so the entry looks like other items without relying on private MUI classes.
+      style: {
+        display: "flex",
+        alignItems: "center",
+        gap: "12px",
+        width: "100%",
+        textDecoration: "none",
+        color: "inherit",
+      },
+    },
+    children: [
+      {
+        tag: "img",
+        props: {
+          src: getIconUrl(),
+          alt: CFG.displayName,
+          style: { width: "20px", height: "20px" },
+        },
+      },
+      {
+        tag: "span",
+        props: {
+          style: {
+            fontSize: "14px",
+            lineHeight: "20px",
+            whiteSpace: "nowrap",
+          },
+        },
+        children: CFG.displayName,
+      },
+    ],
+  };
+
   send({
     type: "basenav:register",
     displayName: CFG.displayName,
     routeName: CFG.baseNavRouteName,
 
-    // Left-rail clickable entry
-    contents: {
-      tag: "Link",
-      // The UEF docs show a `to` field at the element root in the basenav example.
-      // The Link element type also supports `props.to`. We provide BOTH for maximum
-      // compatibility across Learn/UEF versions.
-      to: CFG.baseNavRouteName,
-      props: { to: CFG.baseNavRouteName },
-      // Keep the contents simple: a visible text label (icon isn't required here).
-      children: CFG.displayName,
-    },
+    // What renders in the left-nav entry (fixes the "empty spot" issue)
+    initialContents: navEntryContents,
   });
 }
 
@@ -234,7 +273,6 @@ function openPanel(reason) {
   panelCorrelationId = rid("ask-mappy-panel");
   closeCallbackId = `${panelCorrelationId}-close`;
 
-  // IMPORTANT: must use panelTitle/panelType (not title/size) per UEF panel schema.
   send({
     type: "portal:panel",
     correlationId: panelCorrelationId,
