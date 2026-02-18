@@ -1,35 +1,30 @@
 /**
- * UEF integration script (runs inside Blackboard Learn Ultra).
+ * public/uef.js
  *
- * Goal (your request):
- * - Show "Ask Mappy" in the LEFT base navigation (global rail)
- * - Make it look like native nav items (Marks, Courses, etc.)
- * - When user clicks it, OPEN a RIGHT-SIDE PANEL and load widget.html in an iframe.
- * - Keep the (?) Help menu entry and make it open the same panel.
+ * Behavior:
+ * - Help menu (question mark): registers "Ask Mappy" as an auxiliary help provider.
+ * - Left Base Nav: shows "Ask Mappy" like other nav items and opens the same right-side panel.
  *
- * Notes:
- * - Base nav register supports `initialContents`
- * - Click callbacks use `props.onClick.callbackId` and return via `portal:callback`
+ * Key fixes:
+ * - Force visible label color (white-ish)
+ * - Prevent Firefox "too much recursion" focus trap loop by:
+ *   (1) debouncing panel open requests
+ *   (2) opening the panel async on base-nav click (setTimeout 0)
  */
 
 const CFG = {
-  // Help provider
   helpProviderId: "noodlefactory-help",
   displayName: "Ask Mappy",
   providerType: "auxiliary",
 
-  // Base nav
+  // Required by basenav registration
   baseNavRouteName: "ask-mappy",
-  baseNavAltRouteName: "base.ask-mappy",
 
-  // Assets
   iconPath: "/nf-help-icon.png",
   widgetPath: "/widget.html",
 
-  // Token storage key (set by uef-boot.html)
-  tokenStorageKey: "UEF_BEARER_TOKEN",
+  tokenStorageKey: "uef_user_token",
 
-  // Panel config
   panelType: "small",
   panelTitle: "Ask Mappy",
 };
@@ -40,12 +35,15 @@ let authorized = false;
 let helpRegistered = false;
 let baseNavRegistered = false;
 
-let portalId = null;
+// Panel state
+let panelPortalId = null;
 let panelCorrelationId = null;
 let closeCallbackId = null;
+let panelOpening = false;
+let lastPanelOpenAt = 0;
 
-// Base-nav portal slot
-let baseNavButtonPortalId = null;
+// Base nav portal (where we render the left nav entry UI)
+let baseNavPortalId = null;
 
 // Callback ids
 const BASE_NAV_OPEN_CALLBACK_ID = "ask-mappy-open";
@@ -93,76 +91,10 @@ function logOut(msg, obj) {
   else console.log(`[UEF] ${msg}`);
 }
 
-/* --------------------- message send wrapper --------------------- */
-
 function send(message) {
   if (!port) return;
   logOut("→", message);
   port.postMessage(message);
-}
-
-/* ------------------------- base-nav contents ------------------------- */
-
-function buildBaseNavButtonContents() {
-  // Styling is intentionally inline to mimic native items without relying on private MUI classnames.
-  return {
-    tag: "button",
-    props: {
-      type: "button",
-      "aria-label": CFG.displayName,
-      onClick: { callbackId: BASE_NAV_OPEN_CALLBACK_ID, mode: "sync" },
-      style: {
-        all: "unset",
-        boxSizing: "border-box",
-        cursor: "pointer",
-        width: "100%",
-        height: "38px",
-        display: "flex",
-        alignItems: "center",
-        gap: "12px",
-        padding: "0 16px",
-        color: "inherit",
-      },
-    },
-    children: [
-      {
-        tag: "img",
-        props: {
-          src: getIconUrl(),
-          alt: "",
-          style: {
-            width: "18px",
-            height: "18px",
-            display: "block",
-            flex: "0 0 auto",
-          },
-        },
-      },
-      {
-        tag: "span",
-        props: {
-          style: {
-            fontSize: "14px",
-            lineHeight: "20px",
-            whiteSpace: "nowrap",
-            overflow: "hidden",
-            textOverflow: "ellipsis",
-          },
-        },
-        children: CFG.displayName,
-      },
-    ],
-  };
-}
-
-function renderBaseNavButton() {
-  if (!baseNavButtonPortalId) return;
-
-  send({
-    type: "portal:render",
-    portalId: baseNavButtonPortalId,
-    contents: buildBaseNavButtonContents(),
-  });
 }
 
 /* ------------------------- handshake ------------------------- */
@@ -197,6 +129,7 @@ window.addEventListener("message", (event) => {
 
   port = p;
   port.onmessage = onPortMessage;
+  logOut("Handshake complete; MessagePort acquired.");
 
   authorize();
 });
@@ -206,9 +139,7 @@ window.addEventListener("message", (event) => {
 function authorize() {
   const token = getToken();
   if (!token) {
-    console.warn(
-      "[UEF] No UEF token found. Ensure /uef-boot.html ran and stored it."
-    );
+    console.warn("[UEF] No UEF token found.");
     return;
   }
   send({ type: "authorization:authorize", token });
@@ -217,13 +148,7 @@ function authorize() {
 function subscribeEvents() {
   send({
     type: "event:subscribe",
-    subscriptions: [
-      "route",
-      "portal:new",
-      "portal:remove",
-      "click",
-      "help:request",
-    ],
+    subscriptions: ["portal:new", "portal:remove", "help:request"],
   });
 }
 
@@ -243,11 +168,70 @@ function registerHelpProvider() {
 function registerBaseNav() {
   if (baseNavRegistered) return;
 
+  // Keep registration minimal; we render into the base nav portal for click behavior & styling
   send({
     type: "basenav:register",
     displayName: CFG.displayName,
     routeName: CFG.baseNavRouteName,
-    initialContents: buildBaseNavButtonContents(),
+  });
+}
+
+/* ------------------------- Base Nav Rendering ------------------------- */
+
+function buildBaseNavContents() {
+  return {
+    tag: "button",
+    props: {
+      type: "button",
+      "aria-label": CFG.displayName,
+      onClick: { callbackId: BASE_NAV_OPEN_CALLBACK_ID, mode: "sync" },
+      style: {
+        width: "100%",
+        height: "38px",
+        display: "flex",
+        alignItems: "center",
+        gap: "12px",
+        padding: "0 16px",
+        background: "transparent",
+        border: "none",
+        cursor: "pointer",
+        textAlign: "left",
+        font: "inherit",
+      },
+    },
+    children: [
+      {
+        tag: "img",
+        props: {
+          src: getIconUrl(),
+          alt: "",
+          style: { width: "18px", height: "18px", display: "block" },
+        },
+      },
+      {
+        tag: "span",
+        props: {
+          style: {
+            fontSize: "14px",
+            lineHeight: "20px",
+            // ✅ FIX: force visible color like native Ultra nav
+            color: "rgba(255,255,255,0.87)",
+            WebkitTextFillColor: "rgba(255,255,255,0.87)",
+            whiteSpace: "nowrap",
+          },
+        },
+        children: CFG.displayName,
+      },
+    ],
+  };
+}
+
+function renderBaseNav() {
+  if (!baseNavPortalId) return;
+  send({
+    type: "portal:render",
+    portalId: baseNavPortalId,
+    contents: buildBaseNavContents(),
   });
 }
 
@@ -260,7 +244,13 @@ function renderWidget(targetPortalId) {
     contents: {
       tag: "div",
       props: {
-        style: { height: "100%", width: "100%", padding: "0", margin: "0" },
+        style: {
+          height: "100%",
+          width: "100%",
+          padding: "0",
+          margin: "0",
+          display: "flex",
+        },
       },
       children: [
         {
@@ -278,11 +268,19 @@ function renderWidget(targetPortalId) {
 function openPanel(reason) {
   if (!authorized) return;
 
-  if (portalId) {
-    logOut(`Panel already open; re-render (${reason}).`);
-    renderWidget(portalId);
+  // ✅ If panel already open, just re-render
+  if (panelPortalId) {
+    renderWidget(panelPortalId);
     return;
   }
+
+  // ✅ Debounce / gate panel opens
+  const now = Date.now();
+  if (panelOpening) return;
+  if (now - lastPanelOpenAt < 250) return;
+
+  panelOpening = true;
+  lastPanelOpenAt = now;
 
   panelCorrelationId = rid("ask-mappy-panel");
   closeCallbackId = `${panelCorrelationId}-close`;
@@ -298,45 +296,21 @@ function openPanel(reason) {
 
 /* ------------------------- handlers ------------------------- */
 
-function handleRouteEvent(msg) {
-  const rn = msg.routeName;
-  if (rn !== CFG.baseNavRouteName && rn !== CFG.baseNavAltRouteName) return;
-  openPanel("basenav-route");
-}
-
 function handleHelpRequest(msg) {
   send({ type: "help:request:response", correlationId: msg.correlationId });
   openPanel("help-menu");
 }
 
 function handlePortalNew(msg) {
+  // This is the base nav integration slot portal
   if (msg.selector === "base.navigation.button") {
-    baseNavButtonPortalId = msg.portalId;
-    renderBaseNavButton();
+    baseNavPortalId = msg.portalId;
+    renderBaseNav();
   }
 }
 
 function handlePortalRemove(msg) {
-  if (msg.portalId && msg.portalId === baseNavButtonPortalId) {
-    baseNavButtonPortalId = null;
-  }
-}
-
-function handlePortalCallback(msg) {
-  const callbackId = msg.callbackId;
-  if (!callbackId) return;
-
-  if (callbackId === BASE_NAV_OPEN_CALLBACK_ID) {
-    openPanel("base-nav-click");
-    return;
-  }
-
-  if (closeCallbackId && callbackId === closeCallbackId) {
-    logOut("Panel closed.");
-    portalId = null;
-    panelCorrelationId = null;
-    closeCallbackId = null;
-  }
+  if (msg.portalId === baseNavPortalId) baseNavPortalId = null;
 }
 
 /* ------------------------- port message router ------------------------- */
@@ -359,7 +333,6 @@ function onPortMessage(event) {
     authorized = false;
     helpRegistered = false;
     baseNavRegistered = false;
-    console.error("[UEF] Unauthorized:", msg.errorInformation || msg);
     return;
   }
 
@@ -373,40 +346,52 @@ function onPortMessage(event) {
     return;
   }
 
-  if (msg.type === "help:request") {
-    handleHelpRequest(msg);
-    return;
-  }
-
   if (msg.type === "event:event") {
-    if (msg.eventType === "route") return handleRouteEvent(msg);
     if (msg.eventType === "help:request") return handleHelpRequest(msg);
     if (msg.eventType === "portal:new") return handlePortalNew(msg);
-    if (msg.eventType === "portal:remove" || msg.eventType === "portal:removed")
-      return handlePortalRemove(msg);
-    return;
-  }
-
-  if (msg.type === "portal:callback") {
-    handlePortalCallback(msg);
+    if (msg.eventType === "portal:remove") return handlePortalRemove(msg);
     return;
   }
 
   if (msg.type === "portal:panel:response") {
     if (!panelCorrelationId || msg.correlationId !== panelCorrelationId) return;
 
+    panelOpening = false;
+
     if (msg.status !== "success") {
-      console.error("[UEF] portal:panel failed:", msg);
-      portalId = null;
+      panelPortalId = null;
       panelCorrelationId = null;
       closeCallbackId = null;
       return;
     }
 
-    portalId = msg.portalId;
-    logOut("Panel opened. portalId =", portalId);
-    renderWidget(portalId);
+    panelPortalId = msg.portalId;
+    renderWidget(panelPortalId);
     return;
+  }
+
+  if (msg.type === "portal:callback") {
+    // ✅ Base nav click: open panel async to avoid focus-trap recursion in Firefox
+    if (msg.callbackId === BASE_NAV_OPEN_CALLBACK_ID) {
+      setTimeout(() => {
+        try {
+          if (document.activeElement && document.activeElement.blur) {
+            document.activeElement.blur();
+          }
+        } catch {}
+        openPanel("base-nav-click");
+      }, 0);
+      return;
+    }
+
+    // ✅ Panel close callback
+    if (msg.callbackId === closeCallbackId) {
+      panelPortalId = null;
+      panelCorrelationId = null;
+      closeCallbackId = null;
+      panelOpening = false;
+      return;
+    }
   }
 }
 
