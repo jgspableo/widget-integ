@@ -205,7 +205,12 @@ function buildBaseNavContents() {
         props: {
           src: getIconUrl(),
           alt: "",
-          style: { width: "18px", height: "18px", display: "block" },
+          style: {
+            width: "26px",
+            height: "26px",
+            display: "block",
+            objectFit: "contain",
+          },
         },
       },
       {
